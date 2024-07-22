@@ -16,6 +16,7 @@ from protenc.models import EmbeddingType
 def get_input_reader_cls(args):
     input_path = Path(args.input_path)
     infer = args.input_format in [None, 'infer']
+
     if infer:
         input_format = input_path.suffix[1:]
     else:
@@ -32,6 +33,7 @@ def get_input_reader_cls(args):
 def get_output_reader_cls(args):
     output_path = Path(args.output_path)
     infer = args.input_format in [None, 'infer']
+
     if infer:
         output_format = output_path.suffix[1:]
     else:
@@ -67,6 +69,7 @@ def main(args):
     input_reader = args.input_reader_cls.from_args(args.input_path, args)
 
     transform_fn = model.prepare_sequences
+
     if args.substitute_wildcards:
         transform_fn = lambda seqs: transform_fn([utils.sub_nucleotide_wildcards(s) for s in seqs])
 
@@ -152,7 +155,7 @@ def entrypoint():
                         help='Which devices to use for data parallelism.')
     parser.add_argument('--no_gpu', action='store_true',
                         help='Use the CPU for inference.')
-    parser.add_argument('--compute_mean', '--pool', action='store_true',
+    parser.add_argument('--compute_mean', '--pool', action='stor_true',
                         help='Compute the average over the sequence axis of embeddings. '
                              'Applies only if the used model does produce sequence-wise outputs.')
     parser.add_argument('--substitute_wildcards', action='store_true',

@@ -27,7 +27,6 @@ class BaseInputReader(ABC):
         pass
 
 
-
 class BaseOutputWriter:
     @staticmethod
     def add_arguments_to_parser(parser):
@@ -47,11 +46,7 @@ class BaseOutputWriter:
 
 
 class CSVReader(BaseInputReader):
-    def __init__(self,
-                 path,
-                 delimiter=',',
-                 label_col='label',
-                 sequence_col='protein'):
+    def __init__(self, path, delimiter=",", label_col="label", sequence_col="protein"):
         self.path = Path(path)
 
         self.delimiter = delimiter
@@ -60,9 +55,9 @@ class CSVReader(BaseInputReader):
 
     @staticmethod
     def add_arguments_to_parser(parser: argparse.ArgumentParser):
-        parser.add_argument('--csv_reader.delimiter', default=',')
-        parser.add_argument('--csv_reader.label_col', default='label')
-        parser.add_argument('--csv_reader.sequence_col', default='protein')
+        parser.add_argument("--csv_reader.delimiter", default=",")
+        parser.add_argument("--csv_reader.label_col", default="label")
+        parser.add_argument("--csv_reader.sequence_col", default="protein")
 
     @classmethod
     def from_args(cls, path, args):
@@ -70,15 +65,15 @@ class CSVReader(BaseInputReader):
             path,
             delimiter=args.csv_reader.delimiter,
             label_col=args.csv_reader.label_col,
-            sequence_col=args.csv_reader.sequence_col
+            sequence_col=args.csv_reader.sequence_col,
         )
 
     def __iter__(self):
         with self.path.open() as fp:
             reader = DictReader(fp, delimiter=self.delimiter)
+
             for row in reader:
                 yield row[self.label_col], row[self.sequence_col]
-
 
 
 class JSONReader(BaseInputReader):
@@ -88,7 +83,7 @@ class JSONReader(BaseInputReader):
 
     @staticmethod
     def add_arguments_to_parser(parser: argparse.ArgumentParser):
-        parser.add_argument('--json_reader.stream', action='store_true')
+        parser.add_argument("--json_reader.stream", action="store_true")
 
     @classmethod
     def from_args(cls, path, args):
@@ -99,7 +94,9 @@ class JSONReader(BaseInputReader):
             try:
                 import json_stream
             except ImportError:
-                raise ImportError('json_stream needs to be installed for streaming json input.')
+                raise ImportError(
+                    "json_stream needs to be installed for streaming json input."
+                )
 
             json_load = json_stream.load
         else:
@@ -120,11 +117,11 @@ class FASTAReader(BaseInputReader):
 
     def __iter__(self):
         with self.path.open() as fp:
-            fasta_sequences = SeqIO.parse(fp, 'fasta')
+            fasta_sequences = SeqIO.parse(fp, "fasta")
+
             for fasta in fasta_sequences:
                 label, sequence = fasta.id, str(fasta.seq)
                 yield label, sequence
-
 
 
 class LMDBWriter(BaseOutputWriter):
@@ -132,18 +129,23 @@ class LMDBWriter(BaseOutputWriter):
         self.path = path
         self.lmdb_kwargs = lmdb_kwargs
         self.ctx = None
+        self.counter = 0
 
     @staticmethod
     def add_arguments_to_parser(parser: argparse.ArgumentParser):
-        parser.add_argument('--lmdb_writer.map_size', action=HumanFriendlyParsingAction, default=2 ** 30)
-        parser.add_argument('--lmdb_writer.no_sub_dir', action='store_true')
+        parser.add_argument(
+            "--lmdb_writer.map_size", action=HumanFriendlyParsingAction, default=2**30
+        )
+        parser.add_argument("--lmdb_writer.no_sub_dir", action="store_true")
+        parser.add_argument("--lmdb_writer.flush_after", default=500)
 
     @classmethod
     def from_args(cls, path, args):
         return cls(
             path,
             map_size=args.lmdb_writer.map_size,
-            subdir=not args.lmdb_writer.no_sub_dir
+            subdir=not args.lmdb_writer.no_sub_dir,
+            flush_after=args.lmdb_writer.flush_after,
         )
 
     def _callback(self, label, embedding):
@@ -151,7 +153,20 @@ class LMDBWriter(BaseOutputWriter):
         assert isinstance(label, str) and isinstance(embedding, np.ndarray)
 
         _, txn = self.ctx
-        txn.put(label.encode(), pickle.dumps(embedding))
+        try:
+            txn.put(label.encode(), pickle.dumps(embedding))
+            self.counter += 1
+            if self.counter % self.flush_after == 0:
+                txn.commit()
+                txn = self.ctx[0].begin(write=True)
+                self.ctx = (self.ctx[0], txn)
+        except lmdb.MapFullError:
+            print("Map full, resizing")
+            txn.abort()
+            env = lmdb.open(str(self.path), **self.lmdb_kwargs)
+            txn = env.begin(write=True)
+            self.ctx = (env, txn)
+            txn.put(label.encode(), pickle.dumps(embedding))
 
     def __enter__(self) -> Callable[[str, np.ndarray], None]:
         if self.ctx is None:
@@ -167,12 +182,6 @@ class LMDBWriter(BaseOutputWriter):
         env.close()
 
 
-input_format_mapping = {
-    'csv': CSVReader,
-    'json': JSONReader,
-    'fasta': FASTAReader
-}
+input_format_mapping = {"csv": CSVReader, "json": JSONReader, "fasta": FASTAReader}
 
-output_format_mapping = {
-    'lmdb': LMDBWriter
-}
+output_format_mapping = {"lmdb": LMDBWriter}
