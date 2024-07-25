@@ -15,19 +15,19 @@ from humanfriendly import parse_size
 from torch.utils.data import IterableDataset
 
 nucleotide_wildcard_mapping = {
-    'R': ['A', 'G'],
-    'Y': ['C', 'T'],
-    'S': ['G', 'C'],
-    'W': ['A', 'T'],
-    'K': ['G', 'T'],
-    'M': ['A', 'C'],
-    'B': ['C', 'G', 'T'],
-    'D': ['A', 'G', 'T'],
-    'H': ['A', 'C', 'T'],
-    'V': ['A', 'C', 'G']
+    "R": ["A", "G"],
+    "Y": ["C", "T"],
+    "S": ["G", "C"],
+    "W": ["A", "T"],
+    "K": ["G", "T"],
+    "M": ["A", "C"],
+    "B": ["C", "G", "T"],
+    "D": ["A", "G", "T"],
+    "H": ["A", "C", "T"],
+    "V": ["A", "C", "G"],
 }
 nucleotide_wildcards = set(nucleotide_wildcard_mapping)
-nucleotide_wildcard_re = re.compile('(' + '|'.join(nucleotide_wildcards) + ')')
+nucleotide_wildcard_re = re.compile("(" + "|".join(nucleotide_wildcards) + ")")
 
 
 def identity(x, *args, **kwargs):
@@ -77,7 +77,11 @@ def to_device(o, device=None):
 def sub_nucleotide_wildcards(seq):
     res = seq
     for match in nucleotide_wildcard_re.finditer(seq):
-        res = res[:match.start()] + random.choice(nucleotide_wildcard_mapping[match.group()]) + res[match.end():]
+        res = (
+            res[: match.start()]
+            + random.choice(nucleotide_wildcard_mapping[match.group()])
+            + res[match.end() :]
+        )
     return res
 
 
@@ -89,17 +93,20 @@ def read_from_lmdb(path):
 
 
 return_formats = {
-    'torch': (torch.Tensor, torch.tensor),
-    'numpy': (np.ndarray, np.array)
+    "torch": (torch.Tensor, torch.tensor),
+    "numpy": (np.ndarray, np.array),
 }
+
 
 def to_return_format(x, return_format):
     format = return_formats.get(return_format)
 
     if format is None:
-        raise ValueError(f'Unknown return format {return_format}. '
-                         f'Supported formats are {list(return_formats)}')
-    
+        raise ValueError(
+            f"Unknown return format {return_format}. "
+            f"Supported formats are {list(return_formats)}"
+        )
+
     cls, cast_fn = format
 
     if isinstance(x, cls):
@@ -133,11 +140,13 @@ class NestedNamespace(argparse.Namespace):
             setattr(self, key, value)
 
     def __setattr__(self, key, value):
-        parent, *children = key.split('.', maxsplit=1)
+        parent, *children = key.split(".", maxsplit=1)
         if children:
             existing = {}
             if hasattr(self, parent):
                 existing = vars(getattr(self, parent))
-            super().__setattr__(parent, NestedNamespace(**{**existing, children[0]: value}))
+            super().__setattr__(
+                parent, NestedNamespace(**{**existing, children[0]: value})
+            )
         else:
             super().__setattr__(key, value)

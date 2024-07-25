@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import torch
+
 import torch.nn as nn
 
 from collections import OrderedDict
@@ -7,7 +8,11 @@ from typing import Callable
 from enum import Enum
 from transformers import BertModel, BertTokenizer, T5EncoderModel, T5Tokenizer
 from tensordict import TensorDict
-from sequence_models.pretrained import load_carp
+from sequence_models.pretrained import load_model_and_alphabet
+import colorlog as logging
+
+logging.basicConfig()
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingType(Enum):
@@ -31,11 +36,13 @@ def load_huggingface_language_model(
     if load_weights:
         model = model_cls.from_pretrained(model_name)
         tokenizer = tokenizer_cls.from_pretrained(model_name)
+
         return model, tokenizer
     else:
         config = model_cls.config_class.from_pretrained(model_name)
         model = model_cls(config)
         tokenizer = tokenizer_cls.from_pretrained(model_name)
+
         return model, tokenizer
 
 
@@ -146,6 +153,7 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
 
     @torch.no_grad()
     def forward(self, input):
+        logger.debug(f"Input: {input}")
         results = self.model(
             **input, repr_layers=[self.repr_layer], return_contacts=True
         )
@@ -155,32 +163,40 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         for i, seq_len in enumerate(seq_lengths):
             yield token_representations[i, 1 : seq_len - 1]
 
+
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
-    embedding_kind = EmbeddingType.PER_RESIDUE
 
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
-
-        self.model, self.alphabet = load_carp(model_name)
+        # SimpleCollater for carp models
+        self.model, self.collater = load_model_and_alphabet(model_name)
         self.model.eval()
-        self.batch_converter = self.alphabet.get_batch_converter()
         self.repr_layer = repr_layer
 
     def prepare_sequences(self, sequences):
-        _, _, batch_tokens = self.batch_converter([("", seq) for seq in sequences])
+        logger.debug(f"Sequences: {sequences}")
+        sequences = [[s] for s in sequences] # convert to list of lists otherwise collater will fail
+        # returns (sequences,)
+        batch_tokens = self.collater(sequences)[0]
+        logger.debug(f"batch: {batch_tokens}")
 
         return TensorDict({"tokens": batch_tokens}, batch_size=len(sequences))
 
     @torch.no_grad()
     def forward(self, input):
-        results = self.model(
-            **input, repr_layers=[self.repr_layer], return_contacts=True
-        )
+        logger.debug(f"Input: {input}")
+        tokens = input["tokens"]
+        results = self.model(tokens, repr_layers=[self.repr_layer], logits=False)
         token_representations = results["representations"][self.repr_layer]
-        seq_lengths = (input["tokens"] != self.alphabet.padding_idx).sum(1)
+        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(
+            1
+        )
+        logger.debug(f"Token representations: {token_representations}")
+        logger.debug(f"Sequence lengths: {seq_lengths}")
 
         for i, seq_len in enumerate(seq_lengths):
             yield token_representations[i, 1 : seq_len - 1]
+
 
 @dataclass
 class ModelCard:
@@ -198,6 +214,13 @@ class ModelCard:
 
 
 model_descriptions = [
+    ModelCard.from_model_cls(
+        name="carp_640M",
+        family="CARP",
+        embed_dim=1280,
+        model_cls=CarpEmbeddingModel,
+        model_kwargs=dict(model_name="carp_640M", repr_layer=56),
+    ),
     # ProtTrans family (https://github.com/agemagician/ProtTrans)
     ModelCard.from_model_cls(
         name="prot_t5_xl_uniref50",
@@ -284,14 +307,6 @@ model_descriptions = [
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t6_8M_UR50D", repr_layer=6),
     ),
-    ## CARP model
-    ModelCard.from_model_cls(
-        name="carp_640M",
-        family="CARP",
-        embed_dim=1280,
-        model_cls=CarpModel,
-        model_kwargs=dict(model_name="carp_640M", repr_layer=56),
-    ),
 ]
 
 
@@ -329,4 +344,5 @@ def get_model_info(model_name: str):
 
 def get_model(model_name, **kwargs):
     model = model_dict[model_name].init_fn(**kwargs)
+
     return model

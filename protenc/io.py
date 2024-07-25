@@ -10,7 +10,9 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Callable
 from protenc.utils import HumanFriendlyParsingAction
-
+import colorlog as logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 class BaseInputReader(ABC):
     @staticmethod
@@ -127,6 +129,7 @@ class FASTAReader(BaseInputReader):
 class LMDBWriter(BaseOutputWriter):
     def __init__(self, path, **lmdb_kwargs):
         self.path = path
+        self.flush_after = lmdb_kwargs.pop("flush_after", 500)
         self.lmdb_kwargs = lmdb_kwargs
         self.ctx = None
         self.counter = 0
@@ -137,7 +140,7 @@ class LMDBWriter(BaseOutputWriter):
             "--lmdb_writer.map_size", action=HumanFriendlyParsingAction, default=2**30
         )
         parser.add_argument("--lmdb_writer.no_sub_dir", action="store_true")
-        parser.add_argument("--lmdb_writer.flush_after", default=500)
+        parser.add_argument("--lmdb_writer.flush_after", default=5000)
 
     @classmethod
     def from_args(cls, path, args):
@@ -156,12 +159,14 @@ class LMDBWriter(BaseOutputWriter):
         try:
             txn.put(label.encode(), pickle.dumps(embedding))
             self.counter += 1
+
             if self.counter % self.flush_after == 0:
+                logger.info("Flushing transaction")
                 txn.commit()
                 txn = self.ctx[0].begin(write=True)
                 self.ctx = (self.ctx[0], txn)
         except lmdb.MapFullError:
-            print("Map full, resizing")
+            logger.info("Map full, resizing")
             txn.abort()
             env = lmdb.open(str(self.path), **self.lmdb_kwargs)
             txn = env.begin(write=True)
@@ -170,6 +175,7 @@ class LMDBWriter(BaseOutputWriter):
 
     def __enter__(self) -> Callable[[str, np.ndarray], None]:
         if self.ctx is None:
+            logger.debug(self.lmdb_kwargs)
             env = lmdb.open(str(self.path), **self.lmdb_kwargs)
             txn = env.begin(write=True)
             self.ctx = (env, txn)
