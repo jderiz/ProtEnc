@@ -3,7 +3,8 @@ import textwrap
 import torch
 import torch.nn as nn
 import protenc
-
+import os
+import lmdb
 from functools import partial
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -31,7 +32,6 @@ def get_input_reader_cls(args):
         )
 
     return cls
-
 
 def get_output_reader_cls(args):
     output_path = Path(args.output_path)
@@ -69,9 +69,22 @@ def main(args):
     model = protenc.get_model(args.model_name)
     model.eval()
 
-    print(f"Reading data from {args.input_path}")
+    logger.info(f"Reading data from {args.input_path}")
 
     input_reader = args.input_reader_cls.from_args(args.input_path, args)
+    
+    # determine keys present in output lmdb File
+    
+    if os.path.exists(args.output_path) and args.overwrite is False:
+        logger.debug(f"Checking for keys in output file {args.output_path} since overwrite is set to False.")
+        with lmdb.open(args.output_path, readonly=True) as env:
+            keys = utils.get_lmdb_keys(env)
+
+        if keys:
+            logger.info(f"Found {len(keys)} keys in output file. Skipping these.")
+            logger.debug(f"Keys: {keys}")
+            input_reader = io.FilteredInputReader(input_reader, keys)
+
 
     transform_fn = model.prepare_sequences
 
@@ -79,7 +92,6 @@ def main(args):
         transform_fn = lambda seqs: transform_fn(
             [utils.sub_nucleotide_wildcards(s) for s in seqs]
         )
-
     batches = DataLoader(
         utils.IteratorWrapper(input_reader),
         batch_size=args.batch_size,
@@ -242,7 +254,12 @@ def entrypoint():
         "--log_level",
         default="INFO",
         help="Set the log level. Defaults to INFO.",)
-
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False, # by default check lmdb keys
+        help="Overwrite existing output files.",
+    )
     args, rem_args = parser.parse_known_args(namespace=utils.NestedNamespace())
 
     args.input_reader_cls = get_input_reader_cls(args)
@@ -262,10 +279,13 @@ def entrypoint():
             'CRITICAL': 'red,bg_white',
         },
         style='%',
-        level=args.log_level if args.log_level else "INFO",
+        level=args.log_level,
         )
-
+    global logger
     logger = logging.getLogger(__name__)
+    logger.setLevel(args.log_level)
+    logger.debug(f"Arguments: {args}")
+
     main(args)
 
 

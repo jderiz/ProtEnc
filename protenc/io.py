@@ -28,6 +28,22 @@ class BaseInputReader(ABC):
     def __iter__(self):
         pass
 
+class FilteredInputReader(BaseInputReader):
+    def __init__(self, reader: BaseInputReader, filter_keys):
+        self.reader = reader
+        self.filter_keys = filter_keys
+
+    @classmethod
+    def from_args(cls, path, args):
+        pass
+
+    def __iter__(self):
+        for label, sequence in self.reader:
+            if label not in self.filter_keys:
+                yield label, sequence
+
+    def get_filtered_keys(self):
+        return self.filter_keys
 
 class BaseOutputWriter:
     @staticmethod

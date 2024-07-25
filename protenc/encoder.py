@@ -30,6 +30,7 @@ class ProteinEncoder:
         assert isinstance(
             self.batch_size, int
         ), "batch size must be provided as integer at the moment"
+
         return self.dataloader(
             proteins,
             collate_fn=self.prepare_sequences,
@@ -42,6 +43,8 @@ class ProteinEncoder:
 
     def _encode(self, batch):
         with torch.inference_mode(), torch.autocast("cuda", enabled=self.autocast):
+            # calls model.forward()
+
             return self.model(batch)
 
     def _encode_batches(
@@ -64,7 +67,7 @@ class ProteinEncoder:
     def encode(
         self,
         proteins: ProteinEncoderInput,
-        average_sequence: bool = False,
+        average_sequence: bool = False, # actually average over tokens -> sequence embedding
         return_format: ReturnFormat = "torch",
     ):
         if isinstance(proteins, dict):
