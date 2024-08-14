@@ -142,6 +142,8 @@ class FASTAReader(BaseInputReader):
                 yield label, sequence
 
 
+
+
 class LMDBWriter(BaseOutputWriter):
     def __init__(self, path, **lmdb_kwargs):
         self.path = path
@@ -173,6 +175,7 @@ class LMDBWriter(BaseOutputWriter):
 
         _, txn = self.ctx
         try:
+            # TODO: should probably be JSON and not pickled
             txn.put(label.encode(), pickle.dumps(embedding))
             self.counter += 1
 
