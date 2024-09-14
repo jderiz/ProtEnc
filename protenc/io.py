@@ -3,6 +3,7 @@ import json
 import pickle
 import numpy as np
 import lmdb
+import os
 
 from Bio import SeqIO
 from csv import DictReader
@@ -74,8 +75,8 @@ class CSVReader(BaseInputReader):
     @staticmethod
     def add_arguments_to_parser(parser: argparse.ArgumentParser):
         parser.add_argument("--csv_reader.delimiter", default=",")
-        parser.add_argument("--csv_reader.label_col", default="label")
-        parser.add_argument("--csv_reader.sequence_col", default="protein")
+        parser.add_argument("--csv_reader.label_col", default="index")
+        parser.add_argument("--csv_reader.sequence_col", default="sequence")
 
     @classmethod
     def from_args(cls, path, args):
@@ -90,8 +91,12 @@ class CSVReader(BaseInputReader):
         with self.path.open() as fp:
             reader = DictReader(fp, delimiter=self.delimiter)
 
-            for row in reader:
-                yield row[self.label_col], row[self.sequence_col]
+            if self.label_col == "index":
+                for i, row in enumerate(reader):
+                    yield str(i), row[self.sequence_col]
+            else:
+                for row in reader:
+                    yield row[self.label_col], row[self.sequence_col]
 
 
 class JSONReader(BaseInputReader):
@@ -147,7 +152,7 @@ class FASTAReader(BaseInputReader):
 class LMDBWriter(BaseOutputWriter):
     def __init__(self, path, **lmdb_kwargs):
         self.path = path
-        self.flush_after = lmdb_kwargs.pop("flush_after", 500)
+        self.flush_after = lmdb_kwargs.pop("flush_after", 5000) 
         self.lmdb_kwargs = lmdb_kwargs
         self.ctx = None
         self.counter = 0
@@ -195,7 +200,12 @@ class LMDBWriter(BaseOutputWriter):
     def __enter__(self) -> Callable[[str, np.ndarray], None]:
         if self.ctx is None:
             logger.debug(self.lmdb_kwargs)
-            env = lmdb.open(str(self.path), **self.lmdb_kwargs)
+            try:
+                env = lmdb.open(str(self.path), **self.lmdb_kwargs)
+            except FileNotFoundError:
+                msg = f"File {self.path} not found \n Current working directory: {Path.cwd()}"
+                logger.error(msg)
+                raise FileNotFoundError(msg)
             txn = env.begin(write=True)
             self.ctx = (env, txn)
 

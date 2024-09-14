@@ -10,7 +10,7 @@ from transformers import BertModel, BertTokenizer, T5EncoderModel, T5Tokenizer
 from tensordict import TensorDict
 from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
-
+import re
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 
@@ -145,9 +145,17 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         self.model.eval()
         self.batch_converter = self.alphabet.get_batch_converter()
         self.repr_layer = repr_layer
-
+        
+    def clean(self, seq):
+        if not re.match(r'^[ACDEFGHIKLMNPQRSTVWYX]+$', seq):
+            print(f"Invalid sequence: {seq}")
+            # convert unknown characters to X
+            seq = re.sub(r'[^ACDEFGHIKLMNPQRSTVWYX]', 'X', seq)
+            print(f"Converted sequence: {seq}")
+        return seq
+        
     def prepare_sequences(self, sequences):
-        _, _, batch_tokens = self.batch_converter([("", seq) for seq in sequences])
+        _, _, batch_tokens = self.batch_converter([("", self.clean(seq)) for seq in sequences])
 
         return TensorDict({"tokens": batch_tokens}, batch_size=len(sequences))
 
@@ -214,6 +222,7 @@ class ModelCard:
 
 
 model_descriptions = [
+    # CARP family (https://github.com/microsoft/protein-sequence-models)
     ModelCard.from_model_cls(
         name="carp_640M",
         family="CARP",

@@ -46,13 +46,23 @@ for embed in encoder(proteins, return_format='numpy'):
 After installation, use the `protenc` shell command for bulk generation and export of protein embeddings.
 
 ```bash
-protenc sequences.fasta embeddings.lmdb --model_name=<name-of-model>
+python -m protenc.tools.extract --help
+```
+run example:
+- one worker per GPU
+- batch size 128
+- 4 workers
+- use data parallel
+- subsitute amino acid wildcards by possible substitutes
+- lmdb_writer.flush_after 1000
+- lmdb_writer.map_size 100 GiB
+
+```bash
+python -m protenc.tools.extract sequences.fasta  embeddings.lmdb --model_name esm2_t33_650M_UR50D --data_parallel --batch_size 128  --num_workers 4 --substitute_wildcards
 ```
 
 By default, input and output formats are inferred from the file extensions.
-
 Run
-
 ```bash
 protenc --help
 ```
