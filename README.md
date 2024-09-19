@@ -5,6 +5,7 @@ ProtEnc: generate protein embeddings the easy way
 
 * [ProtTrans](https://github.com/agemagician/ProtTrans) family
 * [ESM](https://github.com/facebookresearch/esm)
+* [CARP](https://github.com/microsoft/protein-sequence-models)
 * AlphaFold (coming soon™)
 * [OmegaPLM](https://www.biorxiv.org/content/10.1101/2022.07.21.500999v1) (coming soon™)
 
