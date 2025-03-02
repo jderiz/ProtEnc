@@ -6,7 +6,14 @@ import torch.nn as nn
 from collections import OrderedDict
 from typing import Callable
 from enum import Enum
-from transformers import BertModel, BertTokenizer, T5EncoderModel, T5Tokenizer, EsmModel, AutoTokenizer
+from transformers import (
+    BertModel,
+    BertTokenizer,
+    T5EncoderModel,
+    T5Tokenizer,
+    EsmModel,
+    AutoTokenizer,
+)
 from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
 import re
@@ -14,6 +21,7 @@ from esm.models.esmc import ESMC
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.ERROR)
 
 
 class EmbeddingType(Enum):
@@ -160,7 +168,9 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         # _, _, batch_tokens = self.batch_converter(
         #     [("", self.clean(seq)) for seq in sequences]
         # )
-        batch_tokens = self.tokenizer(sequences, return_tensors="pt", add_special_tokens=True, padding=True)
+        batch_tokens = self.tokenizer(
+            sequences, return_tensors="pt", add_special_tokens=True, padding=True
+        )
 
         # Simply return a dictionary with the tokens
         return batch_tokens
@@ -184,9 +194,11 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         super().__init__()
         self.model: ESMC = ESMC.from_pretrained(model_name)
         self.model.eval()
+        self.pad_idx = self.model.tokenizer.pad_token_id
 
     def prepare_sequences(self, sequences):
         input_ids = self.model._tokenize(sequences)
+        self.padding_mask = input_ids != self.pad_idx
         return input_ids
 
     @torch.no_grad()
@@ -194,13 +206,17 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         output = self.model(input)
 
         for i in range(len(output.embeddings)):
-            yield output.embeddings[i, 1:-1]
+            x = output.embeddings[i]  # get embedding for sequence i
+            x = x[self.padding_mask[i]]  # remove padding tokens
+            yield x[1:-1]  # remove start and end tokens
 
 
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
     """
-    CARP model wrapper. Return a per-sequence embedding.  
+    CARP model wrapper. Return a per-sequence embedding.
     """
+
+    embedding_kind = EmbeddingType.PER_PROTEIN
 
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
@@ -232,7 +248,7 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
         logger.debug(f"Sequence lengths: {seq_lengths}")
 
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, 1 : seq_len - 1]
+            yield token_representations[i, :seq_len]
 
 
 @dataclass
