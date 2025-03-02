@@ -44,7 +44,6 @@ class ProteinEncoder:
     def _encode(self, batch):
         with torch.inference_mode(), torch.autocast("cuda", enabled=self.autocast):
             # calls model.forward()
-
             return self.model(batch)
 
     def _encode_batches(
@@ -56,7 +55,15 @@ class ProteinEncoder:
         batches = self._get_data_loader(proteins)
 
         for batch in batches:
-            batch = batch.to(self.device)
+            # Move batch to device
+            if isinstance(batch, dict):
+                # Move tensors to device
+                batch = {
+                    k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()
+                }
+            else:
+                batch = batch.to(self.device)
 
             for embed in self._encode(batch):
                 if average_sequence:
@@ -67,7 +74,7 @@ class ProteinEncoder:
     def encode(
         self,
         proteins: ProteinEncoderInput,
-        average_sequence: bool = False, # actually average over tokens -> sequence embedding
+        average_sequence: bool = False,  # actually average over tokens -> sequence embedding
         return_format: ReturnFormat = "torch",
     ):
         if isinstance(proteins, dict):
@@ -96,7 +103,16 @@ class ProteinEncoder:
         return_format: ReturnFormat = "torch",
     ):
         batch = self.prepare_sequences(proteins)
-        batch = batch.to(self.device)
+
+        # Move batch to device
+        if isinstance(batch, dict):
+            # Move tensors to device
+            batch = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+        else:
+            batch = batch.to(self.device)
 
         embeds = self._encode(batch)
 

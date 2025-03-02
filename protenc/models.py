@@ -6,11 +6,12 @@ import torch.nn as nn
 from collections import OrderedDict
 from typing import Callable
 from enum import Enum
-from transformers import BertModel, BertTokenizer, T5EncoderModel, T5Tokenizer
-from tensordict import TensorDict
+from transformers import BertModel, BertTokenizer, T5EncoderModel, T5Tokenizer, EsmModel, AutoTokenizer
 from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
 import re
+from esm.models.esmc import ESMC
+
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 
@@ -65,11 +66,9 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         # ProtTrans tokenizers expect whitespaces between residues
         sequences = [" ".join(s.replace(" ", "")) for s in sequences]
 
-        return TensorDict(
-            self.tokenizer.batch_encode_plus(
-                sequences, return_tensors="pt", add_special_tokens=True, padding=True
-            ),
-            batch_size=len(sequences),
+        # Simply return the encoded sequences without TensorDict
+        return self.tokenizer.batch_encode_plus(
+            sequences, return_tensors="pt", add_special_tokens=True, padding=True
         )
 
     def _post_process_embedding(self, embed, seq_len):
@@ -139,40 +138,69 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
 
-        self.model, self.alphabet = torch.hub.load(
-            "facebookresearch/esm:main", model_name
-        )
+        self.model = EsmModel.from_pretrained("facebook/" + model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained("facebook/" + model_name)
+
+        # self.model, self.alphabet = torch.hub.load(
+        #     "facebookresearch/esm:main", model_name
+        # )
         self.model.eval()
-        self.batch_converter = self.alphabet.get_batch_converter()
+        # self.batch_converter = self.alphabet.get_batch_converter()
         self.repr_layer = repr_layer
-        
+
     def clean(self, seq):
-        if not re.match(r'^[ACDEFGHIKLMNPQRSTVWYX]+$', seq):
+        if not re.match(r"^[ACDEFGHIKLMNPQRSTVWYX]+$", seq):
             print(f"Invalid sequence: {seq}")
             # convert unknown characters to X
-            seq = re.sub(r'[^ACDEFGHIKLMNPQRSTVWYX]', 'X', seq)
+            seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWYX]", "X", seq)
             print(f"Converted sequence: {seq}")
         return seq
-        
-    def prepare_sequences(self, sequences):
-        _, _, batch_tokens = self.batch_converter([("", self.clean(seq)) for seq in sequences])
 
-        return TensorDict({"tokens": batch_tokens}, batch_size=len(sequences))
+    def prepare_sequences(self, sequences):
+        # _, _, batch_tokens = self.batch_converter(
+        #     [("", self.clean(seq)) for seq in sequences]
+        # )
+        batch_tokens = self.tokenizer(sequences, return_tensors="pt", add_special_tokens=True, padding=True)
+
+        # Simply return a dictionary with the tokens
+        return batch_tokens
 
     @torch.no_grad()
     def forward(self, input):
         logger.debug(f"Input: {input}")
-        results = self.model(
-            **input, repr_layers=[self.repr_layer], return_contacts=True
-        )
-        token_representations = results["representations"][self.repr_layer]
-        seq_lengths = (input["tokens"] != self.alphabet.padding_idx).sum(1)
+        results = self.model(**input, output_hidden_states=False)
+        token_representations = results["last_hidden_state"]
+        # token_representations = results["hidden_states"][self.repr_layer]
+        seq_lengths = input["attention_mask"].sum(1)
 
         for i, seq_len in enumerate(seq_lengths):
             yield token_representations[i, 1 : seq_len - 1]
 
 
+class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
+    embedding_kind = EmbeddingType.PER_RESIDUE
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.model: ESMC = ESMC.from_pretrained(model_name)
+        self.model.eval()
+
+    def prepare_sequences(self, sequences):
+        input_ids = self.model._tokenize(sequences)
+        return input_ids
+
+    @torch.no_grad()
+    def forward(self, input):
+        output = self.model(input)
+
+        for i in range(len(output.embeddings)):
+            yield output.embeddings[i, 1:-1]
+
+
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
+    """
+    CARP model wrapper. Return a per-sequence embedding.  
+    """
 
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
@@ -183,12 +211,15 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
 
     def prepare_sequences(self, sequences):
         logger.debug(f"Sequences: {sequences}")
-        sequences = [[s] for s in sequences] # convert to list of lists otherwise collater will fail
+        sequences = [
+            [s] for s in sequences
+        ]  # convert to list of lists otherwise collater will fail
         # returns (sequences,)
         batch_tokens = self.collater(sequences)[0]
         logger.debug(f"batch: {batch_tokens}")
 
-        return TensorDict({"tokens": batch_tokens}, batch_size=len(sequences))
+        # Simply return a dictionary with the tokens
+        return {"tokens": batch_tokens}
 
     @torch.no_grad()
     def forward(self, input):
@@ -196,9 +227,7 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
         tokens = input["tokens"]
         results = self.model(tokens, repr_layers=[self.repr_layer], logits=False)
         token_representations = results["representations"][self.repr_layer]
-        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(
-            1
-        )
+        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)
         logger.debug(f"Token representations: {token_representations}")
         logger.debug(f"Sequence lengths: {seq_lengths}")
 
@@ -315,6 +344,21 @@ model_descriptions = [
         embed_dim=320,
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t6_8M_UR50D", repr_layer=6),
+    ),
+    # https://github.com/evolutionaryscale/esm/tree/main
+    ModelCard.from_model_cls(
+        name="esmc_600m",
+        family="ESM",
+        embed_dim=1152,
+        model_cls=ESMCEmbeddingModel,
+        model_kwargs=dict(model_name="esmc_600m"),
+    ),
+    ModelCard.from_model_cls(
+        name="esmc_300m",
+        family="ESM",
+        embed_dim=960,
+        model_cls=ESMCEmbeddingModel,
+        model_kwargs=dict(model_name="esmc_300m"),
     ),
 ]
 

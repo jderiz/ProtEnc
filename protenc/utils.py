@@ -127,6 +127,12 @@ def to_return_format(x, return_format):
     if isinstance(x, cls):
         return x
 
+    # Handle BFloat16 tensors when converting to NumPy
+    if return_format == "numpy" and isinstance(x, torch.Tensor):
+        if x.dtype == torch.bfloat16:
+            # Convert BFloat16 to Float32 before converting to NumPy
+            x = x.to(torch.float32)
+
     return cast_fn(x)
 
 
