@@ -12,7 +12,6 @@ from tqdm import tqdm
 from protenc import io as io, utils
 from protenc.models import EmbeddingType
 import colorlog as logging
-from colorlog import ColoredFormatter
 
 
 def get_input_reader_cls(args):
@@ -32,6 +31,7 @@ def get_input_reader_cls(args):
         )
 
     return cls
+
 
 def get_output_reader_cls(args):
     output_path = Path(args.output_path)
@@ -72,11 +72,13 @@ def main(args):
     logger.info(f"Reading data from {args.input_path}")
 
     input_reader = args.input_reader_cls.from_args(args.input_path, args)
-    
+
     # determine keys present in output lmdb File
-    
+
     if os.path.exists(args.output_path) and args.overwrite is False:
-        logger.debug(f"Checking for keys in output file {args.output_path} since overwrite is set to False.")
+        logger.debug(
+            f"Checking for keys in output file {args.output_path} since overwrite is set to False."
+        )
         with lmdb.open(args.output_path, readonly=True) as env:
             keys = utils.get_lmdb_keys(env)
 
@@ -85,11 +87,10 @@ def main(args):
             logger.debug(f"Keys: {keys}")
             input_reader = io.FilteredInputReader(input_reader, keys)
 
-
     transform_fn = model.prepare_sequences
 
     if args.substitute_wildcards:
-        transform_fn = lambda seqs: transform_fn(
+        transform_fn = lambda seqs: transform_fn(  # noqa: E731
             [utils.sub_nucleotide_wildcards(s) for s in seqs]
         )
     batches = DataLoader(
@@ -253,11 +254,12 @@ def entrypoint():
     parser.add_argument(
         "--log_level",
         default="INFO",
-        help="Set the log level. Defaults to INFO.",)
+        help="Set the log level. Defaults to INFO.",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        default=False, # by default check lmdb keys
+        default=False,  # by default check lmdb keys
         help="Overwrite existing output files.",
     )
     args, rem_args = parser.parse_known_args(namespace=utils.NestedNamespace())
@@ -272,15 +274,15 @@ def entrypoint():
 
     logging.basicConfig(
         log_colors={
-            'DEBUG':    'cyan',
-            'INFO':     'green',
-            'WARNING':  'yellow',
-            'ERROR':    'red',
-            'CRITICAL': 'red,bg_white',
+            "DEBUG": "cyan",
+            "INFO": "green",
+            "WARNING": "yellow",
+            "ERROR": "red",
+            "CRITICAL": "red,bg_white",
         },
-        style='%',
+        style="%",
         level=args.log_level,
-        )
+    )
     global logger
     logger = logging.getLogger(__name__)
     logger.setLevel(args.log_level)
