@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 import torch
-
 import torch.nn as nn
-
+import attr
+import contextlib
 from collections import OrderedDict
 from typing import Callable
 from enum import Enum
@@ -18,6 +18,12 @@ from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
 import re
 from esm.models.esmc import ESMC
+from esm.models.esm3 import ESM3
+from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
+from esm.utils.structure.protein_chain import ProteinChain
+from esm.utils import encoding
+from esm.utils.sampling import _BatchedESMProteinTensor
+from esm.utils.generation import _batch_forward
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -32,7 +38,7 @@ class EmbeddingType(Enum):
 class BaseProteinEmbeddingModel(nn.Module):
     embedding_type: EmbeddingType
 
-    def prepare_sequences(self, sequences):
+    def prepare_sequences(self, sequences, structures=None):
         return NotImplementedError
 
     def forward(self, input):
@@ -103,6 +109,7 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
 
 class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
     available_models = ["prot_bert", "prot_bert_bfd"]
+    structure_aware = False
 
     def __init__(self, model_name: str, load_weights: bool = True):
         self._validate_model_name(model_name)
@@ -125,6 +132,7 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
         "prot_t5_xxl_uniref50",
         "prot_t5_xxl_bfd",
     ]
+    structure_aware = False
 
     def __init__(self, model_name: str, load_weights: bool = True):
         self._validate_model_name(model_name)
@@ -142,6 +150,7 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
 
 class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
+    structure_aware = False
 
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
@@ -187,8 +196,176 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
             yield token_representations[i, 1 : seq_len - 1]
 
 
+class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
+    # largely taken from https://github.com/Dianzhuo-Wang/ esm3-structural-inputs/esm/
+    embedding_kind = EmbeddingType.PER_RESIDUE
+    structure_aware = True
+
+    def __init__(self, model_name: str, use_norm_layer: bool = True):
+        """
+        Initialize the ESM3 embedding model.
+
+        Args:
+            model_name: Name of the ESM3 model to use
+            use_norm_layer: Whether to use the normalized embeddings (transformer.norm applied)
+                           or raw embeddings from the model
+        """
+        super().__init__()
+        self.model: ESM3 = ESM3.from_pretrained(model_name)
+        self.model.eval()
+        self.use_norm_layer = use_norm_layer
+
+    def prepare_sequences(self, sequences, structure_path=None):
+        """
+        Prepare sequences and structures for ESM3 embedding.
+
+        Args:
+            sequences: List of protein sequences
+            structures: Optional list of protein structures (paths to PDB files)
+
+        Returns:
+            List of ESMProteinTensor objects ready for embedding
+        """
+        # Convert sequences to ESMProtein objects and encode them
+        prots = [self.model.encode(ESMProtein(sequence=seq)) for seq in sequences]
+
+        # Process structures if provided
+        if structure_path is not None:
+            # Use single structure for all sequences
+            # complex = ProteinComplex.from_pdb(structure_path)
+            # # check if single chain or multiple chains
+            # if len(complex.chains) > 1:
+            #     # handle multiple chains, find chains with mutations
+            #     for chain in complex.chains:
+            #         pass
+            # else:
+            chain = ProteinChain.from_pdb(structure_path)
+            protein = ESMProtein.from_protein_chain(chain)
+            # select residues to encode in structure
+
+            coords, _, struct_tokens = encoding.tokenize_structure(
+                protein.coordinates,
+                self.model.get_structure_encoder(),
+                structure_tokenizer=self.model.tokenizers.structure,
+                reference_sequence="",
+                add_special_tokens=True,
+            )
+            for prot in prots:
+                prot.coordinates = coords
+                prot.structure = struct_tokens
+
+        return prots
+
+    @torch.no_grad()
+    def forward(self, input):
+        """
+        Generate embeddings for the input sequences.
+
+        Args:
+            input: Single ESMProteinTensor or list of ESMProteinTensor objects
+
+        Yields:
+            Embeddings for each sequence (without special tokens)
+        """
+        # # Handle single input case
+        # if not isinstance(input, list):
+        #     # Make a copy of the input
+        #     protein_tensor = attr.evolve(input)
+        #     device = next(self.model.parameters()).device
+
+        #     # Initialize default values for missing tracks
+        #     default_protein_tensor = ESMProteinTensor.empty(
+        #         len(input) - 2,
+        #         tokenizers=self.model.tokenizers,
+        #         device=input.device,
+        #     )
+        #     for track in attr.fields(ESMProteinTensor):
+        #         if getattr(protein_tensor, track.name, None) is None:
+        #             setattr(
+        #                 protein_tensor,
+        #                 track.name,
+        #                 getattr(default_protein_tensor, track.name, None),
+        #             )
+
+        #     if len(protein_tensor) <= 0:
+        #         raise ValueError("No input data provided")
+
+        #     # Move input protein to proper device
+        #     batched_protein = _BatchedESMProteinTensor.from_protein_tensor(
+        #         protein_tensor
+        #     )
+        #     batched_protein.to(device)
+
+        #     # Get forward output
+        #     forward_output: ForwardOutput = _batch_forward(self.model, batched_protein)
+
+        #     # Apply layer norm if requested
+        #     if self.use_norm_layer:
+        #         with (
+        #             torch.autocast(
+        #                 device_type=device.type, dtype=torch.bfloat16, enabled=True
+        #             )
+        #             if device.type == "cuda"
+        #             else contextlib.nullcontext()
+        #         ):
+        #             embeddings = self.model.transformer.norm(forward_output.embeddings)
+        #     else:
+        #         embeddings = forward_output.embeddings
+
+        #     # Remove special tokens (first and last) and yield
+        #     yield embeddings[1:-1].cpu()
+
+        for protein_tensor in input:
+            # Make a copy of the input
+            protein_tensor = attr.evolve(protein_tensor)
+            device = next(self.model.parameters()).device
+
+            # Initialize default values for missing tracks
+            default_protein_tensor = ESMProteinTensor.empty(
+                len(protein_tensor) - 2,
+                tokenizers=self.model.tokenizers,
+                device=protein_tensor.device,
+            )
+            for track in attr.fields(ESMProteinTensor):
+                if getattr(protein_tensor, track.name, None) is None:
+                    setattr(
+                        protein_tensor,
+                        track.name,
+                        getattr(default_protein_tensor, track.name, None),
+                    )
+
+            if len(protein_tensor) <= 0:
+                raise ValueError("No input data provided")
+
+            # Move input protein to proper device
+            batched_protein = _BatchedESMProteinTensor.from_protein_tensor(
+                protein_tensor
+            )
+            batched_protein.to(device)
+
+            # Get forward output
+            forward_output: ForwardOutput = _batch_forward(self.model, batched_protein)
+
+            # Apply layer norm if requested
+            if self.use_norm_layer:
+                with (
+                    torch.autocast(
+                        device_type=device.type, dtype=torch.bfloat16, enabled=True
+                    )
+                    if device.type == "cuda"
+                    else contextlib.nullcontext()
+                ):
+                    embeddings = self.model.transformer.norm(forward_output.embeddings)
+            else:
+                embeddings = forward_output.embeddings
+            for e in embeddings:
+                # Remove special tokens (first and last) and yield
+                yield e[1:-1].cpu()
+
+
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
+    structure_aware = False
 
     def __init__(self, model_name: str):
         super().__init__()
@@ -217,6 +394,7 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
     """
 
     embedding_kind = EmbeddingType.PER_PROTEIN
+    structure_aware = False
 
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
@@ -320,42 +498,42 @@ model_descriptions = [
     ),
     # ESM family (https://github.com/facebookresearch/esm)
     ModelCard.from_model_cls(
-        name="esm2_t48_15B_UR50D",
+        name="esm2_t48",
         family="ESM",
         embed_dim=5120,
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t48_15B_UR50D", repr_layer=48),
     ),
     ModelCard.from_model_cls(
-        name="esm2_t36_3B_UR50D",
+        name="esm2_t36",
         family="ESM",
         embed_dim=2560,
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t36_3B_UR50D", repr_layer=36),
     ),
     ModelCard.from_model_cls(
-        name="esm2_t33_650M_UR50D",
+        name="esm2_t33",
         family="ESM",
         embed_dim=1280,
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t33_650M_UR50D", repr_layer=33),
     ),
     ModelCard.from_model_cls(
-        name="esm2_t30_150M_UR50D",
+        name="esm2_t30",
         family="ESM",
         embed_dim=640,
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t30_150M_UR50D", repr_layer=30),
     ),
     ModelCard.from_model_cls(
-        name="esm2_t12_35M_UR50D",
+        name="esm2_t12",
         family="ESM",
         embed_dim=480,
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t12_35M_UR50D", repr_layer=12),
     ),
     ModelCard.from_model_cls(
-        name="esm2_t6_8M_UR50D",
+        name="esm2_t6",
         family="ESM",
         embed_dim=320,
         model_cls=ESMEmbeddingModel,
@@ -375,6 +553,13 @@ model_descriptions = [
         embed_dim=960,
         model_cls=ESMCEmbeddingModel,
         model_kwargs=dict(model_name="esmc_300m"),
+    ),
+    ModelCard.from_model_cls(
+        name="esm3",
+        family="ESM",
+        embed_dim=1536,
+        model_cls=ESM3EmbeddingModel,
+        model_kwargs=dict(model_name="esm3_sm_open_v1", use_norm_layer=True),
     ),
 ]
 
