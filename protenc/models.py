@@ -70,6 +70,11 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         self.model = model
         self.model.eval()
         self.tokenizer = tokenizer
+        # Cache device to prevent issues with DataParallel
+        try:
+            self._device = next(self.model.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _validate_model_name(self, model_name):
         assert (
@@ -97,14 +102,16 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         embeddings = output.last_hidden_state.cpu()
         seq_lens = (attn_mask == 1).sum(-1)
 
+        results = []
         for embed, seq_len in zip(embeddings, seq_lens):
             # Tokenized sequences have the following form:
             # [CLS] V N ... I K [SEP] [PAD] ... [PAD]
             #
             # We remove the special tokens ([CLS], [SEP], [PAD]) before
             # computing the mean over the remaining sequence
+            results.append(self._post_process_embedding(embed, seq_len))
 
-            yield self._post_process_embedding(embed, seq_len)
+        return results
 
 
 class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
@@ -158,12 +165,13 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         self.model = EsmModel.from_pretrained("facebook/" + model_name)
         self.tokenizer = AutoTokenizer.from_pretrained("facebook/" + model_name)
 
-        # self.model, self.alphabet = torch.hub.load(
-        #     "facebookresearch/esm:main", model_name
-        # )
         self.model.eval()
-        # self.batch_converter = self.alphabet.get_batch_converter()
         self.repr_layer = repr_layer
+        # Cache device to prevent issues with DataParallel
+        try:
+            self._device = next(self.model.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def clean(self, seq):
         if not re.match(r"^[ACDEFGHIKLMNPQRSTVWYX]+$", seq):
@@ -174,9 +182,6 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         return seq
 
     def prepare_sequences(self, sequences):
-        # _, _, batch_tokens = self.batch_converter(
-        #     [("", self.clean(seq)) for seq in sequences]
-        # )
         batch_tokens = self.tokenizer(
             sequences, return_tensors="pt", add_special_tokens=True, padding=True
         )
@@ -189,11 +194,13 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         logger.debug(f"Input: {input}")
         results = self.model(**input, output_hidden_states=False)
         token_representations = results["last_hidden_state"]
-        # token_representations = results["hidden_states"][self.repr_layer]
         seq_lengths = input["attention_mask"].sum(1)
 
+        embeddings = []
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, 1 : seq_len - 1]
+            embeddings.append(token_representations[i, 1 : seq_len - 1])
+
+        return embeddings
 
 
 class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
@@ -241,6 +248,11 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             # else:
             chain = ProteinChain.from_pdb(structure_path)
             protein = ESMProtein.from_protein_chain(chain)
+            # check same sequence length
+            if len(protein.sequence) != len(sequences[0]):
+                raise ValueError(
+                    f"Sequence length mismatch between structure and sequence: {len(protein.sequence)} != {len(sequences[0])}"
+                )
             # select residues to encode in structure
 
             coords, _, struct_tokens = encoding.tokenize_structure(
@@ -264,61 +276,21 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Args:
             input: Single ESMProteinTensor or list of ESMProteinTensor objects
 
-        Yields:
-            Embeddings for each sequence (without special tokens)
+        Returns:
+            List of embeddings for each sequence (without special tokens)
         """
-        # # Handle single input case
-        # if not isinstance(input, list):
-        #     # Make a copy of the input
-        #     protein_tensor = attr.evolve(input)
-        #     device = next(self.model.parameters()).device
+        results = []
 
-        #     # Initialize default values for missing tracks
-        #     default_protein_tensor = ESMProteinTensor.empty(
-        #         len(input) - 2,
-        #         tokenizers=self.model.tokenizers,
-        #         device=input.device,
-        #     )
-        #     for track in attr.fields(ESMProteinTensor):
-        #         if getattr(protein_tensor, track.name, None) is None:
-        #             setattr(
-        #                 protein_tensor,
-        #                 track.name,
-        #                 getattr(default_protein_tensor, track.name, None),
-        #             )
-
-        #     if len(protein_tensor) <= 0:
-        #         raise ValueError("No input data provided")
-
-        #     # Move input protein to proper device
-        #     batched_protein = _BatchedESMProteinTensor.from_protein_tensor(
-        #         protein_tensor
-        #     )
-        #     batched_protein.to(device)
-
-        #     # Get forward output
-        #     forward_output: ForwardOutput = _batch_forward(self.model, batched_protein)
-
-        #     # Apply layer norm if requested
-        #     if self.use_norm_layer:
-        #         with (
-        #             torch.autocast(
-        #                 device_type=device.type, dtype=torch.bfloat16, enabled=True
-        #             )
-        #             if device.type == "cuda"
-        #             else contextlib.nullcontext()
-        #         ):
-        #             embeddings = self.model.transformer.norm(forward_output.embeddings)
-        #     else:
-        #         embeddings = forward_output.embeddings
-
-        #     # Remove special tokens (first and last) and yield
-        #     yield embeddings[1:-1].cpu()
+        # Get device once at the beginning to avoid StopIteration error in DataParallel
+        try:
+            device = next(self.model.parameters()).device
+        except StopIteration:
+            # Fallback if no parameters - could happen in DataParallel context
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         for protein_tensor in input:
             # Make a copy of the input
             protein_tensor = attr.evolve(protein_tensor)
-            device = next(self.model.parameters()).device
 
             # Initialize default values for missing tracks
             default_protein_tensor = ESMProteinTensor.empty(
@@ -344,7 +316,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             batched_protein.to(device)
 
             # Get forward output
-            forward_output: ForwardOutput = _batch_forward(self.model, batched_protein)
+            forward_output = _batch_forward(self.model, batched_protein)
 
             # Apply layer norm if requested
             if self.use_norm_layer:
@@ -358,9 +330,13 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                     embeddings = self.model.transformer.norm(forward_output.embeddings)
             else:
                 embeddings = forward_output.embeddings
+
+            # Collect all embeddings without yielding
             for e in embeddings:
-                # Remove special tokens (first and last) and yield
-                yield e[1:-1].cpu()
+                # Remove special tokens (first and last)
+                results.append(e[1:-1])
+
+        return results
 
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
@@ -372,6 +348,11 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         self.model: ESMC = ESMC.from_pretrained(model_name)
         self.model.eval()
         self.pad_idx = self.model.tokenizer.pad_token_id
+        # Cache device to prevent issues with DataParallel
+        try:
+            self._device = next(self.model.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def prepare_sequences(self, sequences):
         input_ids = self.model._tokenize(sequences)
@@ -381,11 +362,14 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     @torch.no_grad()
     def forward(self, input):
         output = self.model(input)
+        results = []
 
         for i in range(len(output.embeddings)):
             x = output.embeddings[i]  # get embedding for sequence i
             x = x[self.padding_mask[i]]  # remove padding tokens
-            yield x[1:-1]  # remove start and end tokens
+            results.append(x[1:-1])  # remove start and end tokens
+
+        return results
 
 
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
@@ -402,6 +386,11 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
         self.model, self.collater = load_model_and_alphabet(model_name)
         self.model.eval()
         self.repr_layer = repr_layer
+        # Cache device to prevent issues with DataParallel
+        try:
+            self._device = next(self.model.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def prepare_sequences(self, sequences):
         logger.debug(f"Sequences: {sequences}")
@@ -425,8 +414,11 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
         logger.debug(f"Token representations: {token_representations}")
         logger.debug(f"Sequence lengths: {seq_lengths}")
 
+        embeddings = []
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, :seq_len]
+            embeddings.append(token_representations[i, :seq_len])
+
+        return embeddings
 
 
 @dataclass
