@@ -19,7 +19,7 @@ import colorlog as logging
 import re
 from esm.models.esmc import ESMC
 from esm.models.esm3 import ESM3
-from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
+from esm.sdk.api import ESMProtein, ESMProteinTensor
 from esm.utils.structure.protein_chain import ProteinChain
 from esm.utils import encoding
 from esm.utils.sampling import _BatchedESMProteinTensor
@@ -99,7 +99,7 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
 
         output = self.model(**input)
 
-        embeddings = output.last_hidden_state.cpu()
+        embeddings = output.last_hidden_state  # Don't move to CPU
         seq_lens = (attn_mask == 1).sum(-1)
 
         results = []
@@ -204,7 +204,7 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
 
 
 class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
-    # largely taken from https://github.com/Dianzhuo-Wang/ esm3-structural-inputs/esm/
+    # largely taken from https://github.com/Dianzhuo-Wang/esm3-structural-inputs/esm/
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
 
@@ -222,13 +222,13 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         self.model.eval()
         self.use_norm_layer = use_norm_layer
 
-    def prepare_sequences(self, sequences, structure_path=None):
+    def prepare_sequences(self, sequences, structure_path: str | None = None):
         """
         Prepare sequences and structures for ESM3 embedding.
 
         Args:
             sequences: List of protein sequences
-            structures: Optional list of protein structures (paths to PDB files)
+            structures: Optional path to a protein structure (PDB file)
 
         Returns:
             List of ESMProteinTensor objects ready for embedding
@@ -238,23 +238,18 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
         # Process structures if provided
         if structure_path is not None:
-            # Use single structure for all sequences
-            # complex = ProteinComplex.from_pdb(structure_path)
-            # # check if single chain or multiple chains
-            # if len(complex.chains) > 1:
-            #     # handle multiple chains, find chains with mutations
-            #     for chain in complex.chains:
-            #         pass
-            # else:
+
+            # Use the structure for all sequences
             chain = ProteinChain.from_pdb(structure_path)
             protein = ESMProtein.from_protein_chain(chain)
-            # check same sequence length
+
+            # Check same sequence length
             if len(protein.sequence) != len(sequences[0]):
                 raise ValueError(
                     f"Sequence length mismatch between structure and sequence: {len(protein.sequence)} != {len(sequences[0])}"
                 )
-            # select residues to encode in structure
 
+            # Process structure
             coords, _, struct_tokens = encoding.tokenize_structure(
                 protein.coordinates,
                 self.model.get_structure_encoder(),
@@ -262,6 +257,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                 reference_sequence="",
                 add_special_tokens=True,
             )
+
+            # Apply structure to all proteins
             for prot in prots:
                 prot.coordinates = coords
                 prot.structure = struct_tokens
@@ -331,7 +328,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             else:
                 embeddings = forward_output.embeddings
 
-            # Collect all embeddings without yielding
+            # Collect all embeddings without moving to CPU
+            # Let DataParallel handle device movement
             for e in embeddings:
                 # Remove special tokens (first and last)
                 results.append(e[1:-1])
@@ -364,10 +362,14 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         output = self.model(input)
         results = []
 
+        # Make sure padding_mask is on the same device as the tensors
+        device = output.embeddings.device
+        padding_mask = self.padding_mask.to(device)
+
         for i in range(len(output.embeddings)):
             x = output.embeddings[i]  # get embedding for sequence i
-            x = x[self.padding_mask[i]]  # remove padding tokens
-            results.append(x[1:-1])  # remove start and end tokens
+            x = x[padding_mask[i]]  # remove padding tokens
+            results.append(x[1:-1])  # remove start and end tokens, keep on GPU
 
         return results
 
@@ -414,11 +416,28 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
         logger.debug(f"Token representations: {token_representations}")
         logger.debug(f"Sequence lengths: {seq_lengths}")
 
-        embeddings = []
-        for i, seq_len in enumerate(seq_lengths):
-            embeddings.append(token_representations[i, :seq_len])
+        # Check if per-protein (already aggregated) or per-residue
+        if self.embedding_kind == EmbeddingType.PER_PROTEIN:
+            # Just return the per-protein embeddings without CPU transfer
+            return [token_representations[i] for i in range(len(seq_lengths))]
+        else:
+            # For per-residue, handle padding to ensure uniform size
+            max_len = max(seq_lengths).item()
+            embeddings = []
+            embed_dim = token_representations.shape[-1]
+            device = token_representations.device
 
-        return embeddings
+            for i, seq_len in enumerate(seq_lengths):
+                # Get the actual sequence embedding without CPU transfer
+                seq_embed = token_representations[i, :seq_len]
+
+                # Create padded version on the same device to ensure uniform shape
+                padded_embed = torch.zeros((max_len, embed_dim), device=device)
+                padded_embed[:seq_len] = seq_embed
+
+                embeddings.append(padded_embed)
+
+            return embeddings
 
 
 @dataclass

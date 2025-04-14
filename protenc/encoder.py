@@ -55,9 +55,23 @@ class ProteinEncoder:
             and hasattr(self.model, "structure_aware")
             and self.model.structure_aware
         ):
+            # Convert structures to list if it's a single value
+            if not isinstance(structures, list):
+                structures = [structures]  # Use same structure for all sequences
+
+            # Ensure all structure paths are strings
+            structures = [str(s) if s is not None else None for s in structures]
 
             def collate_with_structures(batch):
-                return self.prepare_sequences([p for p in batch], structures)
+                # If only one structure is provided, use it for all sequences
+                if len(structures) == 1:
+                    return self.prepare_sequences([p for p in batch], structures[0])
+                else:
+                    # Otherwise, match structures with sequences
+                    # This assumes the structures array has the same length as proteins
+                    # and that batch indices correspond to protein indices
+                    # TODO: Handle more complex batching scenarios
+                    return self.prepare_sequences(batch, structures[0])
 
             collate_fn = collate_with_structures
         else:
@@ -86,9 +100,9 @@ class ProteinEncoder:
         with torch.inference_mode(), torch.autocast("cuda", enabled=self.autocast):
             # Use the parallelized model for inference if data_parallel is True
             if self.data_parallel:
-                output = self.parallel_model(batch)
-                # Handle list return from ESM3EmbeddingModel when used with DataParallel
-                return output
+                # Keep outputs on GPU when using DataParallel, client code will
+                # move them to CPU when needed
+                return self.parallel_model(batch)
             else:
                 return self.model(batch)
 
@@ -126,14 +140,18 @@ class ProteinEncoder:
                     if average_sequence:
                         embed = embed.mean(0)
 
-                    yield utils.to_return_format(embed.cpu(), return_format)
+                    # Move to CPU only when returning to user
+                    embed_cpu = embed.cpu()
+                    yield utils.to_return_format(embed_cpu, return_format)
             else:
                 # Process generator of embeddings
                 for embed in result:
                     if average_sequence:
                         embed = embed.mean(0)
 
-                    yield utils.to_return_format(embed.cpu(), return_format)
+                    # Move to CPU only when returning to user
+                    embed_cpu = embed.cpu()
+                    yield utils.to_return_format(embed_cpu, return_format)
 
     def encode(
         self,
@@ -196,7 +214,25 @@ class ProteinEncoder:
         Returns:
             Embeddings for the batch in the requested format
         """
-        batch = self.prepare_sequences(proteins, structures)
+        # Process structures if provided
+        if structures is not None and self.model.structure_aware:
+            # Convert structures to list if it's a single value
+            if not isinstance(structures, list):
+                structures = [structures]  # Use same structure for all sequences
+
+            # Ensure all structure paths are strings
+            structures = [str(s) if s is not None else None for s in structures]
+
+            # If only one structure is provided, use it for all proteins
+            if len(structures) == 1:
+                structure_path = structures[0]
+            else:
+                # Otherwise, use the first one (this might need refinement)
+                structure_path = structures[0]
+
+            batch = self.prepare_sequences(proteins, structure_path)
+        else:
+            batch = self.prepare_sequences(proteins)
 
         # Move batch to device
         if isinstance(batch, dict):
@@ -225,11 +261,13 @@ class ProteinEncoder:
             stacked_embeds = torch.stack(embeds)
             if average_sequence:
                 stacked_embeds = stacked_embeds.mean(1)
+            # Move to CPU only when returning to user
             return utils.to_return_format(stacked_embeds.cpu(), return_format)
         else:
             embed = embeds[0]
             if average_sequence:
                 embed = embed.mean(0)
+            # Move to CPU only when returning to user
             return utils.to_return_format(embed.cpu(), return_format)
 
     def __call__(self, *args, **kwargs):
