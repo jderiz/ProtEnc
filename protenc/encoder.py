@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import protenc.utils as utils
 
 from functools import cached_property
@@ -16,29 +15,12 @@ class ProteinEncoder:
         autocast: bool = False,
         preprocess_workers: int = 0,
         dataloader: DataLoader = DataLoader,
-        data_parallel: bool = False,
-        device_ids: list[int] = None,
     ):
         self.model = model
         self.batch_size = 1 if batch_size is None else batch_size
         self.autocast = autocast  # Automatic mixed precision, saves memory and time at little accuracy cost
         self.preprocess_workers = preprocess_workers
         self.dataloader = dataloader
-        self.data_parallel = data_parallel
-
-        # Apply DataParallel only for inference if requested
-        device = next(iter(self.model.parameters())).device
-        if data_parallel and "cuda" in device.type:
-            # When using DataParallel, ensure model is on device_ids[0] or cuda:0 by default
-            primary_device = (
-                f"cuda:{device_ids[0]}"
-                if device_ids and len(device_ids) > 0
-                else "cuda:0"
-            )
-            self.model = self.model.to(primary_device)
-            self.parallel_model = nn.DataParallel(self.model, device_ids=device_ids)
-        else:
-            self.parallel_model = self.model
 
     @cached_property
     def device(self):
@@ -55,23 +37,9 @@ class ProteinEncoder:
             and hasattr(self.model, "structure_aware")
             and self.model.structure_aware
         ):
-            # Convert structures to list if it's a single value
-            if not isinstance(structures, list):
-                structures = [structures]  # Use same structure for all sequences
-
-            # Ensure all structure paths are strings
-            structures = [str(s) if s is not None else None for s in structures]
 
             def collate_with_structures(batch):
-                # If only one structure is provided, use it for all sequences
-                if len(structures) == 1:
-                    return self.prepare_sequences([p for p in batch], structures[0])
-                else:
-                    # Otherwise, match structures with sequences
-                    # This assumes the structures array has the same length as proteins
-                    # and that batch indices correspond to protein indices
-                    # TODO: Handle more complex batching scenarios
-                    return self.prepare_sequences(batch, structures[0])
+                return self.prepare_sequences([p for p in batch], structures)
 
             collate_fn = collate_with_structures
         else:
@@ -98,13 +66,8 @@ class ProteinEncoder:
     def _encode(self, batch):
         """Process a batch through the model and return embeddings."""
         with torch.inference_mode(), torch.autocast("cuda", enabled=self.autocast):
-            # Use the parallelized model for inference if data_parallel is True
-            if self.data_parallel:
-                # Keep outputs on GPU when using DataParallel, client code will
-                # move them to CPU when needed
-                return self.parallel_model(batch)
-            else:
-                return self.model(batch)
+            # calls model.forward()
+            return self.model(batch)
 
     def _encode_batches(
         self,
@@ -125,33 +88,16 @@ class ProteinEncoder:
                     for k, v in batch.items()
                 }
             elif isinstance(batch, list):
-                # Handle list of tensors
+                # Handle list of tensors 
                 batch = [b.to(self.device) if hasattr(b, "to") else b for b in batch]
             else:
                 batch = batch.to(self.device)
 
-            # Get embeddings from model
-            result = self._encode(batch)
+            for embed in self._encode(batch):
+                if average_sequence:
+                    embed = embed.mean(0)
 
-            # Handle both generator and list return types
-            if isinstance(result, list):
-                # Process list of embeddings
-                for embed in result:
-                    if average_sequence:
-                        embed = embed.mean(0)
-
-                    # Move to CPU only when returning to user
-                    embed_cpu = embed.cpu()
-                    yield utils.to_return_format(embed_cpu, return_format)
-            else:
-                # Process generator of embeddings
-                for embed in result:
-                    if average_sequence:
-                        embed = embed.mean(0)
-
-                    # Move to CPU only when returning to user
-                    embed_cpu = embed.cpu()
-                    yield utils.to_return_format(embed_cpu, return_format)
+                yield utils.to_return_format(embed.cpu(), return_format)
 
     def encode(
         self,
@@ -214,25 +160,7 @@ class ProteinEncoder:
         Returns:
             Embeddings for the batch in the requested format
         """
-        # Process structures if provided
-        if structures is not None and self.model.structure_aware:
-            # Convert structures to list if it's a single value
-            if not isinstance(structures, list):
-                structures = [structures]  # Use same structure for all sequences
-
-            # Ensure all structure paths are strings
-            structures = [str(s) if s is not None else None for s in structures]
-
-            # If only one structure is provided, use it for all proteins
-            if len(structures) == 1:
-                structure_path = structures[0]
-            else:
-                # Otherwise, use the first one (this might need refinement)
-                structure_path = structures[0]
-
-            batch = self.prepare_sequences(proteins, structure_path)
-        else:
-            batch = self.prepare_sequences(proteins)
+        batch = self.prepare_sequences(proteins, structures)
 
         # Move batch to device
         if isinstance(batch, dict):
@@ -248,43 +176,28 @@ class ProteinEncoder:
             batch = batch.to(self.device)
 
         # Get embeddings
-        result = self._encode(batch)
-
-        # Handle both list and generator return types
-        if isinstance(result, list):
-            embeds = result
-        else:
-            embeds = list(result)
+        embeds = list(self._encode(batch))
 
         # For batched output, stack the embeddings
         if len(embeds) > 1:
             stacked_embeds = torch.stack(embeds)
             if average_sequence:
                 stacked_embeds = stacked_embeds.mean(1)
-            # Move to CPU only when returning to user
             return utils.to_return_format(stacked_embeds.cpu(), return_format)
         else:
             embed = embeds[0]
             if average_sequence:
                 embed = embed.mean(0)
-            # Move to CPU only when returning to user
             return utils.to_return_format(embed.cpu(), return_format)
 
     def __call__(self, *args, **kwargs):
         return self.encode(*args, **kwargs)
 
 
-def get_encoder(
-    model_name, device=None, data_parallel=False, device_ids=None, **kwargs
-):
+def get_encoder(model_name, device=None, **kwargs):
     model = get_model(model_name)
 
     if device is not None:
-        # For DataParallel, make sure the device is the primary device in device_ids if provided
-        if data_parallel and "cuda" in device and device_ids and len(device_ids) > 0:
-            device = f"cuda:{device_ids[0]}"
         model = model.to(device)
 
-    return ProteinEncoder(
-        model, data_parallel=data_parallel, device_ids=device_ids, **kwargs
-    )
+    return ProteinEncoder(model, **kwargs)
