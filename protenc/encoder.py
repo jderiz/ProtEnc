@@ -88,7 +88,7 @@ class ProteinEncoder:
                     for k, v in batch.items()
                 }
             elif isinstance(batch, list):
-                # Handle list of tensors 
+                # Handle list of tensors
                 batch = [b.to(self.device) if hasattr(b, "to") else b for b in batch]
             else:
                 batch = batch.to(self.device)
@@ -103,7 +103,7 @@ class ProteinEncoder:
         self,
         proteins: ProteinEncoderInput,
         structures=None,
-        average_sequence: bool = False,  # actually average over tokens -> sequence embedding
+        average_sequence: bool = True,  # actually average over tokens -> sequence embedding
         return_format: ReturnFormat = "torch",
     ):
         """
