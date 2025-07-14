@@ -15,6 +15,7 @@ class ProteinEncoder:
         autocast: bool = False,
         preprocess_workers: int = 0,
         dataloader: DataLoader = DataLoader,
+        pdb_path: str = None,
     ):
         self.model = model
         self.batch_size = 1 if batch_size is None else batch_size
@@ -65,7 +66,9 @@ class ProteinEncoder:
 
     def _encode(self, batch):
         """Process a batch through the model and return embeddings."""
-        with torch.inference_mode(), torch.autocast("cuda", enabled=self.autocast):
+        with torch.inference_mode(), torch.amp.autocast(
+            device_type="cuda", enabled=self.autocast
+        ):
             # calls model.forward()
             return self.model(batch)
 
