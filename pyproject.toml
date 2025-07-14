@@ -21,6 +21,7 @@ sentencepiece = ">=0.1.99"
 json-stream = ">=2.3.2"
 humanfriendly = ">=10.0"
 pytest = ">=7.4.2"
+sequence_models = "*"
 # tensordict dependency has been removed
 
 [[tool.poetry.source]]

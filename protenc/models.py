@@ -17,9 +17,9 @@ from transformers import (
 from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
 import re
-from esm.models.esmc import ESMC
+from esm.models.esmc import ESMC, ESMCOutput
 from esm.models.esm3 import ESM3
-from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
+from esm.sdk.api import ESMProtein, ESMProteinTensor
 from esm.utils.structure.protein_chain import ProteinChain
 from esm.utils import encoding
 from esm.utils.sampling import _BatchedESMProteinTensor
@@ -542,14 +542,19 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         self.pad_idx = self.model.tokenizer.pad_token_id
 
     def prepare_sequences(self, sequences):
-        input_ids = self.model._tokenize(sequences)
+        # check if model is wrapped in DataParallel
+        if isinstance(self.model, torch.nn.DataParallel):
+            input_ids = self.model.module._tokenize(sequences)
+        else:
+            input_ids = self.model._tokenize(sequences)
         self.padding_mask = input_ids != self.pad_idx
         return input_ids
 
     @torch.no_grad()
     def forward(self, input):
-        output = self.model(input)
+        output: ESMCOutput = self.model(input)
 
+        # Yield embeddings to maintain compatibility with other models
         for i in range(len(output.embeddings)):
             x = output.embeddings[i]  # get embedding for sequence i
             x = x[self.padding_mask[i]]  # remove padding tokens
