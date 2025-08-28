@@ -221,6 +221,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
     def _fix_tokenizer_if_needed(self):
         """Fix the tokenizer if mask_token is None but exists in vocabulary (Singularity issue)."""
+        self._ensure_unwrapped_model()
         if self.tokenizer.mask_token is None and "<mask>" in self.tokenizer.vocab:
             logger.info(
                 "Fixing ESM3 tokenizer mask_token for Singularity compatibility"
@@ -275,6 +276,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Custom encoding function that works around the None mask_token issue in Singularity.
         This is a safer alternative to model.encode() that works in both Docker and Singularity.
         """
+        self._ensure_unwrapped_model()
         if protein.sequence is None:
             raise ValueError("sequence is required for encoding")
 
@@ -331,6 +333,9 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Returns:
             List of ESMProteinTensor objects ready for embedding
         """
+        # Ensure underlying model is not wrapped in DataParallel
+        self._ensure_unwrapped_model()
+
         # Convert sequences to ESMProtein objects and encode them using the safe encoder
         prots = [self._safe_encode(ESMProtein(sequence=seq)) for seq in sequences]
 
@@ -373,6 +378,9 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Yields:
             Embeddings for each sequence (without special tokens)
         """
+        # Ensure underlying model is not wrapped in DataParallel
+        self._ensure_unwrapped_model()
+
         # Make sure tokenizers are properly fixed before using them
         self._fix_tokenizer_if_needed()
 
@@ -484,6 +492,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Create an empty ESMProteinTensor with safe defaults for tokenizers.
         This method avoids using the encoding.get_default_*_tokens functions which require mask_token_id.
         """
+        self._ensure_unwrapped_model()
         # Create minimal tensor with just sequence tokens
         sequence_tokenizer = self.model.tokenizers.sequence
 
@@ -529,6 +538,15 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
         # Return a minimal tensor with just the sequence
         return ESMProteinTensor(sequence=sequence_tokens.to(device))
+
+    def _ensure_unwrapped_model(self):
+        """Ensure self.model is the underlying ESM3 module, not a DataParallel wrapper.
+
+        This check is inexpensive and safe to run whenever needed.
+        """
+        if isinstance(self.model, torch.nn.DataParallel):
+            # Unwrap DataParallel to access attributes like tokenizers
+            self.model = self.model.module
 
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
