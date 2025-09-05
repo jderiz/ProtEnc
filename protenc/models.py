@@ -197,7 +197,7 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
 
 
 class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
-    # largely taken from https://github.com/Dianzhuo-Wang/ esm3-structural-inputs/esm/
+    """ESM3 embedding model that can handle sequences and structures."""
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
 
@@ -212,115 +212,49 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """
         super().__init__()
         self.model: ESM3 = ESM3.from_pretrained(model_name)
-        self.tokenizer = self.model.tokenizers.sequence
         self.model.eval()
         self.use_norm_layer = use_norm_layer
+        self.model_name = model_name
 
-        # Fix tokenizer if mask_token is None but exists in vocabulary
-        self._fix_tokenizer_if_needed()
+    def _get_model(self):
+        """Get the underlying model, handling DataParallel wrapping."""
+        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
 
-    def _fix_tokenizer_if_needed(self):
-        """Fix the tokenizer if mask_token is None but exists in vocabulary (Singularity issue)."""
-        self._ensure_unwrapped_model()
-        if self.tokenizer.mask_token is None and "<mask>" in self.tokenizer.vocab:
-            logger.info(
-                "Fixing ESM3 tokenizer mask_token for Singularity compatibility"
-            )
-            self.tokenizer.mask_token = "<mask>"
-            self.tokenizer.mask_token_id = self.tokenizer.vocab["<mask>"]
-
-            # Also fix other tokenizers in the model if they exist
-            for track in [
-                "sequence",
-                "structure",
-                "secondary_structure",
-                "sasa",
-                "function",
-                "residue_annotations",
-            ]:
-                if hasattr(self.model.tokenizers, track):
-                    tokenizer = getattr(self.model.tokenizers, track)
-                    if (
-                        hasattr(tokenizer, "mask_token")
-                        and tokenizer.mask_token is None
-                        and hasattr(tokenizer, "vocab")
-                        and "<mask>" in tokenizer.vocab
-                    ):
-                        tokenizer.mask_token = "<mask>"
-                        tokenizer.mask_token_id = tokenizer.vocab["<mask>"]
-                        logger.info(f"Fixed {track} tokenizer mask_token")
-
-                    # Check that required tokens are set for empty tensor creation
-                    if (
-                        hasattr(tokenizer, "bos_token")
-                        and tokenizer.bos_token is None
-                        and hasattr(tokenizer, "vocab")
-                        and "<cls>" in tokenizer.vocab
-                    ):
-                        tokenizer.bos_token = "<cls>"
-                        tokenizer.bos_token_id = tokenizer.vocab["<cls>"]
-                        logger.info(f"Fixed {track} tokenizer bos_token")
-
-                    if (
-                        hasattr(tokenizer, "eos_token")
-                        and tokenizer.eos_token is None
-                        and hasattr(tokenizer, "vocab")
-                        and "<eos>" in tokenizer.vocab
-                    ):
-                        tokenizer.eos_token = "<eos>"
-                        tokenizer.eos_token_id = tokenizer.vocab["<eos>"]
-                        logger.info(f"Fixed {track} tokenizer eos_token")
-
-    def _safe_encode(self, protein):
+    def _safe_encode(self, protein: ESMProtein) -> ESMProteinTensor:
         """
-        Custom encoding function that works around the None mask_token issue in Singularity.
-        This is a safer alternative to model.encode() that works in both Docker and Singularity.
+        Encode an ESMProtein to ESMProteinTensor using the model's encode method.
         """
-        self._ensure_unwrapped_model()
         if protein.sequence is None:
             raise ValueError("sequence is required for encoding")
 
-        # First check if we can use the standard encoding (if tokenizer is fixed)
-        if self.tokenizer.mask_token is not None:
-            try:
-                return self.model.encode(protein)
-            except Exception as e:
-                logger.warning(
-                    f"Standard encoding failed: {e}. Falling back to custom encoding."
-                )
-
-        # Fallback custom encoding approach
-        sequence = protein.sequence
-        # Replace underscore with X as a safe alternative
-        sequence = sequence.replace("_", "X")
-
-        # Use the tokenizer directly
-        sequence_tokens = self.tokenizer.encode(sequence, add_special_tokens=True)
-        sequence_tokens = torch.tensor(sequence_tokens, dtype=torch.int64)
-
-        # Create the protein tensor with just the sequence
-        protein_tensor = ESMProteinTensor(sequence=sequence_tokens)
-
-        # Also handle structure information if provided in the input protein
-        if protein.coordinates is not None:
-            try:
-                structure_encoder = self.model.get_structure_encoder()
-                structure_tokenizer = self.model.tokenizers.structure
-
-                coords, plddt, struct_tokens = encoding.tokenize_structure(
-                    protein.coordinates,
-                    structure_encoder,
-                    structure_tokenizer=structure_tokenizer,
-                    reference_sequence=protein.sequence,
-                    add_special_tokens=True,
-                )
-
-                protein_tensor.coordinates = coords
-                protein_tensor.structure = struct_tokens
-            except Exception as e:
-                logger.warning(f"Failed to encode structure: {e}")
-
-        return protein_tensor
+        try:
+            return self._get_model().encode(protein)
+        except Exception as e:
+            logger.warning(f"Standard encoding failed: {e}. Using fallback encoding.")
+            
+            # Fallback: create tensor manually
+            sequence_tokenizer = self._get_model().tokenizers.sequence
+            sequence_tokens = sequence_tokenizer.encode(protein.sequence, add_special_tokens=True)
+            sequence_tokens = torch.tensor(sequence_tokens, dtype=torch.int64)
+            
+            protein_tensor = ESMProteinTensor(sequence=sequence_tokens)
+            
+            # Handle structure if provided
+            if protein.coordinates is not None:
+                try:
+                    coords, plddt, struct_tokens = encoding.tokenize_structure(
+                        protein.coordinates,
+                        self._get_model().get_structure_encoder(),
+                        structure_tokenizer=self._get_model().tokenizers.structure,
+                        reference_sequence=protein.sequence,
+                        add_special_tokens=True,
+                    )
+                    protein_tensor.coordinates = coords
+                    protein_tensor.structure = struct_tokens
+                except Exception as e:
+                    logger.warning(f"Failed to encode structure: {e}")
+                    
+            return protein_tensor
 
     def prepare_sequences(self, sequences, structure_path=None):
         """
@@ -328,44 +262,39 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
         Args:
             sequences: List of protein sequences
-            structures: Optional list of protein structures (paths to PDB files)
+            structure_path: Optional path to structure file for structure-aware encoding
 
         Returns:
             List of ESMProteinTensor objects ready for embedding
         """
-        # Ensure underlying model is not wrapped in DataParallel
-        self._ensure_unwrapped_model()
-
-        # Convert sequences to ESMProtein objects and encode them using the safe encoder
-        prots = [self._safe_encode(ESMProtein(sequence=seq)) for seq in sequences]
-
-        # Process structures if provided
+        # Create ESMProtein objects
+        proteins = [ESMProtein(sequence=seq) for seq in sequences]
+        
+        # Add structure information if provided
         if structure_path is not None:
-            # Use single structure for all sequences
-            # complex = ProteinComplex.from_pdb(structure_path)
-            # # check if single chain or multiple chains
-            # if len(complex.chains) > 1:
-            #     # handle multiple chains, find chains with mutations
-            #     for chain in complex.chains:
-            #         pass
-            #     protein = ESMProtein.from_complex(complex)
-            # else:
-            chain = ProteinChain.from_pdb(structure_path)
-            protein = ESMProtein.from_protein_chain(chain)
-            # select residues to encode in structure
+            try:
+                # Load structure
+                chain = ProteinChain.from_pdb(structure_path)
+                protein_with_structure = ESMProtein.from_protein_chain(chain)
+                
+                # Tokenize structure once
+                coords, _, struct_tokens = encoding.tokenize_structure(
+                    protein_with_structure.coordinates,
+                    self._get_model().get_structure_encoder(),
+                    structure_tokenizer=self._get_model().tokenizers.structure,
+                    reference_sequence="",
+                    add_special_tokens=True,
+                )
+                
+                # Add structure to all proteins
+                for protein in proteins:
+                    protein.coordinates = protein_with_structure.coordinates
+                    
+            except Exception as e:
+                logger.warning(f"Failed to load structure from {structure_path}: {e}")
 
-            coords, _, struct_tokens = encoding.tokenize_structure(
-                protein.coordinates,
-                self.model.get_structure_encoder(),
-                structure_tokenizer=self.model.tokenizers.structure,
-                reference_sequence="",
-                add_special_tokens=True,
-            )
-            for prot in prots:
-                prot.coordinates = coords
-                prot.structure = struct_tokens
-
-        return prots
+        # Encode all proteins
+        return [self._safe_encode(protein) for protein in proteins]
 
     @torch.no_grad()
     def forward(self, input):
@@ -373,180 +302,116 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Generate embeddings for the input sequences.
 
         Args:
-            input: Single ESMProteinTensor or list of ESMProteinTensor objects
+            input: List of ESMProteinTensor objects
 
         Yields:
             Embeddings for each sequence (without special tokens)
         """
-        # Ensure underlying model is not wrapped in DataParallel
-        self._ensure_unwrapped_model()
-
-        # Make sure tokenizers are properly fixed before using them
-        self._fix_tokenizer_if_needed()
+        device = next(self.model.parameters()).device
+        model = self._get_model()
 
         for protein_tensor in input:
-            # Make a copy of the input
-            protein_tensor = attr.evolve(protein_tensor)
-            device = next(self.model.parameters()).device
-
-            # Initialize default values for missing tracks
             try:
-                # Create empty protein tensor with safer approach
-                seq_len = len(protein_tensor) - 2  # minus special tokens
+                # Move to device and prepare input
+                protein_tensor = attr.evolve(protein_tensor)
+                
+                # Prepare inputs for forward pass
+                inputs = {}
+                
+                # Always include sequence
+                if protein_tensor.sequence is not None:
+                    inputs["sequence_tokens"] = protein_tensor.sequence.to(device).unsqueeze(0)
+                
+                # Include structure if available
+                if hasattr(protein_tensor, 'structure') and protein_tensor.structure is not None:
+                    inputs["structure_tokens"] = protein_tensor.structure.to(device).unsqueeze(0)
+                
+                # Include coordinates if available
+                if hasattr(protein_tensor, 'coordinates') and protein_tensor.coordinates is not None:
+                    inputs["structure_coords"] = protein_tensor.coordinates.to(device).unsqueeze(0)
 
-                # Custom implementation of empty tensor creation to avoid mask_token_id issues
-                default_protein_tensor = self._create_empty_tensor(seq_len, device)
-
-                for track in attr.fields(ESMProteinTensor):
-                    if getattr(protein_tensor, track.name, None) is None:
-                        setattr(
-                            protein_tensor,
-                            track.name,
-                            getattr(default_protein_tensor, track.name, None),
-                        )
-
-                if len(protein_tensor) <= 0:
-                    raise ValueError("No input data provided")
-
-                # Move input protein to proper device
-                batched_protein = _BatchedESMProteinTensor.from_protein_tensor(
-                    protein_tensor
-                )
-                batched_protein.to(device)
-
-                # Get forward output
-                forward_output = _batch_forward(self.model, batched_protein)
-
-                # Apply layer norm if requested
-                if self.use_norm_layer:
-                    with (
-                        torch.autocast(
-                            device_type=device.type, dtype=torch.bfloat16, enabled=True
-                        )
-                        if device.type == "cuda"
-                        else contextlib.nullcontext()
-                    ):
-                        embeddings = self.model.transformer.norm(
-                            forward_output.embeddings
-                        )
-                else:
-                    embeddings = forward_output.embeddings
-
-                # Check if embeddings is empty or has wrong shape
-                if embeddings.shape[0] == 0:
-                    logger.warning(
-                        f"Got empty embeddings with shape {embeddings.shape}, attempting alternative approach"
+                # Run forward pass manually to avoid ESMOutput incompatibility with DataParallel
+                with (
+                    torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True)
+                    if device.type == "cuda"
+                    else contextlib.nullcontext()
+                ):
+                    # Extract required inputs
+                    sequence_tokens = inputs["sequence_tokens"]
+                    structure_tokens = inputs.get("structure_tokens", None)
+                    structure_coords = inputs.get("structure_coords", None)
+                    
+                    # Get model components
+                    if isinstance(self.model, torch.nn.DataParallel):
+                        encoder = self.model.module.encoder
+                        transformer = self.model.module.transformer
+                        tokenizers = self.model.module.tokenizers
+                    else:
+                        encoder = model.encoder
+                        transformer = model.transformer
+                        tokenizers = model.tokenizers
+                    
+                    # Set up defaults similar to ESM3.forward
+                    B, L = sequence_tokens.shape
+                    
+                    # Handle structure tokens
+                    if structure_tokens is None:
+                        from esm.utils.constants import esm3 as C
+                        structure_tokens = torch.full((B, L), C.STRUCTURE_MASK_TOKEN, dtype=torch.long, device=device)
+                    
+                    # Handle other required inputs with defaults
+                    ss8_tokens = torch.full((B, L), 8, dtype=torch.long, device=device)  # PAD token
+                    sasa_tokens = torch.full((B, L), 16, dtype=torch.long, device=device)  # PAD token
+                    function_tokens = torch.full((B, L, 8), 0, dtype=torch.long, device=device)  # PAD token
+                    residue_annotation_tokens = torch.full((B, L, 16), 0, dtype=torch.long, device=device)  # PAD token
+                    average_plddt = torch.ones((B, L), dtype=torch.float, device=device)
+                    per_res_plddt = torch.zeros((B, L), dtype=torch.float, device=device)
+                    chain_id = torch.zeros((B, L), dtype=torch.long, device=device)
+                    sequence_id = torch.zeros((B, L), dtype=torch.long, device=device)
+                    
+                    # Handle structure coordinates
+                    if structure_coords is None:
+                        structure_coords = torch.full((B, L, 3, 3), float("nan"), dtype=torch.float, device=device)
+                    
+                    # Build affine representation from coordinates
+                    from esm.utils.structure.affine3d import build_affine3d_from_coordinates
+                    structure_coords = structure_coords[..., :3, :]  # Ensure correct shape
+                    affine, affine_mask = build_affine3d_from_coordinates(structure_coords)
+                    
+                    # Run through encoder
+                    x = encoder(
+                        sequence_tokens,
+                        structure_tokens,
+                        average_plddt,
+                        per_res_plddt,
+                        ss8_tokens,
+                        sasa_tokens,
+                        function_tokens,
+                        residue_annotation_tokens,
                     )
-                    # Try direct method - run model manually
-                    sequence_tokens = protein_tensor.sequence.to(device).unsqueeze(
-                        0
-                    )  # Add batch dimension
-                    attention_mask = torch.ones_like(sequence_tokens, dtype=torch.bool)
-
-                    # Run model forward pass directly
-                    outputs = self.model.transformer(
-                        input_ids=sequence_tokens,
-                        attention_mask=attention_mask,
-                        return_dict=True,
-                    )
-
-                    # Get last hidden state
-                    last_hidden = outputs.last_hidden_state
+                    
+                    # Run through transformer
+                    x, embeddings, _ = transformer(x, sequence_id, affine, affine_mask, chain_id)
 
                     # Apply layer norm if requested
-                    if self.use_norm_layer and hasattr(self.model.transformer, "norm"):
-                        with (
-                            torch.autocast(
-                                device_type=device.type,
-                                dtype=torch.bfloat16,
-                                enabled=True,
-                            )
-                            if device.type == "cuda"
-                            else contextlib.nullcontext()
-                        ):
-                            last_hidden = self.model.transformer.norm(last_hidden)
+                    if self.use_norm_layer and hasattr(transformer, 'norm'):
+                        embeddings = transformer.norm(embeddings)
 
-                    # Remove batch dimension and special tokens
-                    embeddings = last_hidden[0, 1:-1]
+                # Remove batch dimension and special tokens
+                if len(embeddings.shape) == 3:
+                    # [batch_size, seq_len, hidden_dim] -> [seq_len, hidden_dim]
+                    embeddings = embeddings[0, 1:-1]
                 else:
-                    # Remove special tokens (first and last)
-                    if len(embeddings.shape) == 3 and embeddings.shape[0] > 0:
-                        # If batched format: [batch_size, seq_len, hidden_dim]
-                        embeddings = embeddings[0, 1:-1]
-                    else:
-                        # If unbatched: [seq_len, hidden_dim]
-                        embeddings = embeddings[1:-1]
+                    # [seq_len, hidden_dim]
+                    embeddings = embeddings[1:-1]
 
-                # Return the embeddings
                 yield embeddings.cpu()
 
             except Exception as e:
                 logger.error(f"Error in forward pass: {e}")
                 import traceback
-
                 logger.error(traceback.format_exc())
                 raise
-
-    def _create_empty_tensor(self, length, device="cpu"):
-        """
-        Create an empty ESMProteinTensor with safe defaults for tokenizers.
-        This method avoids using the encoding.get_default_*_tokens functions which require mask_token_id.
-        """
-        self._ensure_unwrapped_model()
-        # Create minimal tensor with just sequence tokens
-        sequence_tokenizer = self.model.tokenizers.sequence
-
-        # Make sure the tokenizer has the required values
-        if (
-            sequence_tokenizer.mask_token_id is None
-            and "<mask>" in sequence_tokenizer.vocab
-        ):
-            sequence_tokenizer.mask_token = "<mask>"
-            sequence_tokenizer.mask_token_id = sequence_tokenizer.vocab["<mask>"]
-
-        if (
-            sequence_tokenizer.bos_token_id is None
-            and "<cls>" in sequence_tokenizer.vocab
-        ):
-            sequence_tokenizer.bos_token = "<cls>"
-            sequence_tokenizer.bos_token_id = sequence_tokenizer.vocab["<cls>"]
-
-        if (
-            sequence_tokenizer.eos_token_id is None
-            and "<eos>" in sequence_tokenizer.vocab
-        ):
-            sequence_tokenizer.eos_token = "<eos>"
-            sequence_tokenizer.eos_token_id = sequence_tokenizer.vocab["<eos>"]
-
-        if sequence_tokenizer.mask_token_id is None:
-            # If we can't fix the tokenizer, create a basic tensor with values from the vocabulary
-            mask_id = sequence_tokenizer.vocab.get("<mask>", 32)
-            bos_id = sequence_tokenizer.vocab.get("<cls>", 0)
-            eos_id = sequence_tokenizer.vocab.get("<eos>", 2)
-
-            # Create sequence tokens manually
-            sequence_tokens = torch.full((length + 2,), mask_id, dtype=torch.int64)
-            sequence_tokens[0] = bos_id
-            sequence_tokens[-1] = eos_id
-        else:
-            # If the tokenizer is fixed, use the standard function
-            sequence_tokens = torch.full(
-                (length + 2,), sequence_tokenizer.mask_token_id, dtype=torch.int64
-            )
-            sequence_tokens[0] = sequence_tokenizer.bos_token_id
-            sequence_tokens[-1] = sequence_tokenizer.eos_token_id
-
-        # Return a minimal tensor with just the sequence
-        return ESMProteinTensor(sequence=sequence_tokens.to(device))
-
-    def _ensure_unwrapped_model(self):
-        """Ensure self.model is the underlying ESM3 module, not a DataParallel wrapper.
-
-        This check is inexpensive and safe to run whenever needed.
-        """
-        if isinstance(self.model, torch.nn.DataParallel):
-            # Unwrap DataParallel to access attributes like tokenizers
-            self.model = self.model.module
 
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
