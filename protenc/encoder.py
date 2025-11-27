@@ -144,23 +144,9 @@ class ProteinEncoder:
             self.batch_size, int
         ), "batch size must be provided as integer at the moment"
 
-        # Create a collate function that passes structures if they are provided
-        if (
-            structures is not None
-            and hasattr(self.model, "structure_aware")
-            and self.model.structure_aware
-        ):
-
-            def collate_with_structures(batch):
-                return self.prepare_sequences([p for p in batch], structures)
-
-            collate_fn = collate_with_structures
-        else:
-
-            def collate_without_structures(batch):
-                return self.prepare_sequences(batch)
-
-            collate_fn = collate_without_structures
+        # Always pass structures to models - they can decide whether to use them
+        def collate_fn(batch):
+            return self.prepare_sequences([p for p in batch], structures)
 
         return self.dataloader(
             proteins,
@@ -169,12 +155,24 @@ class ProteinEncoder:
             num_workers=self.preprocess_workers,
         )
 
-    def prepare_sequences(self, proteins: list[str], structure_path=None):
+    def prepare_sequences(self, proteins: list[str], structures=None):
         """Prepare protein sequences for encoding, optionally with structures."""
-        if structure_path is not None and self.model.structure_aware:
-            return self.model.prepare_sequences(proteins, structure_path)
-        else:
-            return self.model.prepare_sequences(proteins)
+        # Always pass structures to models - they can decide whether to use them
+        import inspect
+        try:
+            sig = inspect.signature(self.model.prepare_sequences)
+            
+            # Check which parameter name the model uses
+            if 'structures' in sig.parameters:
+                return self.model.prepare_sequences(proteins, structures=structures)
+            elif 'structure_path' in sig.parameters:
+                return self.model.prepare_sequences(proteins, structure_path=structures)
+            else:
+                # Models that don't accept structures parameter (shouldn't happen with base class)
+                return self.model.prepare_sequences(proteins)
+        except (AttributeError, TypeError):
+            # Fallback if signature inspection fails
+            return self.model.prepare_sequences(proteins, structures=structures)
 
     def _encode(self, batch):
         """Process a batch through the model and return embeddings."""

@@ -1,7 +1,4 @@
 import pytest
-import torch
-
-from .fixtures import protein_dict, proteins
 from protenc.models import get_model, get_model_info
 from .utils import list_models_to_test, skip_no_gpu
 

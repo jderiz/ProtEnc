@@ -3,7 +3,6 @@ import torch
 
 from protenc.models import get_model, get_model_info
 from protenc.encoder import get_encoder
-from .fixtures import protein_dict, proteins
 from .utils import list_models_to_test, skip_no_gpu, skip_large_models
 
 
