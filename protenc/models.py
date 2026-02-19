@@ -530,6 +530,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         Returns:
             Dictionary containing featurized inputs ready for forward pass
         """
+        logger.debug(f"Preparing {len(sequences)} sequences for ProteinMPNN")
         if structures is None:
             raise ValueError(
                 "ProteinMPNN requires structure information (PDB files). "
@@ -538,36 +539,47 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
             )
         
         device = next(self.model.parameters()).device
+        pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
+        logger.debug(f"pdb_dict_list: {len(pdb_dict_list)}")
+        if not pdb_dict_list:
+            raise ValueError(f"Failed to parse PDB file: {structures}")
         
-        # Handle single structure case
-        if isinstance(structures, str):
-            pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
-            if not pdb_dict_list:
-                raise ValueError(f"Failed to parse PDB file: {structures}")
-            
-            pdb_dict = pdb_dict_list[0]
-            pdb_seq_len = len(pdb_dict.get('seq', ''))
-            
-            # If sequences provided, check if all have same length as PDB
-            if sequences:
-                if not all(len(seq) == pdb_seq_len for seq in sequences):
-                    raise ValueError(f"All sequences ({len(sequences[0])}) must have the same length as PDB structure ({pdb_seq_len})")
-                # Create batch with same structure but different sequences
-                batch = []
-                for seq in sequences:
-                    seq_dict = pdb_dict.copy()
-                    seq_dict['seq'] = seq
-                    batch.append(seq_dict)
-            else:
-                batch = [pdb_dict]
-        else:
-            # Multiple structures
+        pdb_dict = pdb_dict_list[0]
+        pdb_seq_len = len(pdb_dict.get('seq', ''))
+        
+        # Find all chain letters in the PDB dict
+        chain_keys = [key for key in pdb_dict.keys() if key.startswith('seq_chain_')]
+        chain_letters = [key.replace('seq_chain_', '') for key in chain_keys]
+        
+        # If sequences provided, check if all have same length as PDB
+        if sequences:
+            if not all(len(seq) == pdb_seq_len for seq in sequences):
+                raise ValueError(f"All sequences ({len(sequences[0])}) must have the same length as PDB structure ({pdb_seq_len})")
+            # Create batch with same structure but different sequences
             batch = []
-            for i, pdb_path in enumerate(structures):
-                pdb_dict_list = parse_PDB(pdb_path, ca_only=self.ca_only)
-                if not pdb_dict_list:
-                    raise ValueError(f"Failed to parse PDB file: {pdb_path}")
-                batch.append(pdb_dict_list[0])
+            for seq in sequences:
+                seq_dict = pdb_dict.copy()
+                seq_dict['seq'] = seq
+                # Update all seq_chain_{letter} entries with the new sequence
+                # For multi-chain proteins, we need to split the sequence appropriately
+                # For now, assume single chain or concatenated sequence matches the PDB structure
+                if len(chain_letters) == 1:
+                    # Single chain: replace the entire chain sequence
+                    seq_dict[f'seq_chain_{chain_letters[0]}'] = seq
+                else:
+                    # Multi-chain: need to split sequence by chain lengths
+                    # This is a simplified approach - assumes chains are concatenated in order
+                    start_idx = 0
+                    for letter in chain_letters:
+                        chain_key = f'seq_chain_{letter}'
+                        if chain_key in pdb_dict:
+                            chain_len = len(pdb_dict[chain_key])
+                            seq_dict[chain_key] = seq[start_idx:start_idx + chain_len]
+                            start_idx += chain_len
+                batch.append(seq_dict)
+        else:
+            batch = [pdb_dict]
+
         
         # Featurize using mpnn function
         featurized = tied_featurize(
@@ -590,31 +602,39 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
     def forward(self, input):
         """
         Generate embeddings for the input sequences/structures.
-        
+
         Args:
             input: Dictionary containing featurized inputs from prepare_sequences
-            
+
         Yields:
             Embeddings for each sequence (per-residue)
         """
+        # Follow same logic for feature preparation as in ProteinMPNN in mpnn.py
         device = next(self.model.parameters()).device
         X = input['X'].to(device)
+        S = input['S'].to(device)
         mask = input['mask'].to(device)
         residue_idx = input['residue_idx'].to(device)
         chain_encoding_all = input['chain_encoding_all'].to(device)
         lengths = input['lengths']
-        
-        # Extract encoder embeddings (same logic as ProteinMPNN.forward)
+
+        # --- Feature Preparation (matches ProteinMPNN) ---
+        # Get edge features and indices with ProteinFeatures
         E, E_idx = self.model.features(X, mask, residue_idx, chain_encoding_all)
-        h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
-        h_E = self.model.W_e(E)
         
+        # Sequence and edge projections
+        h_S = self.model.W_s(S)
+        h_V = h_S.clone()  # Initialize h_V with sequence embeddings
+        h_E = self.model.W_e(E)
+
+        # Masking for attention (gather_nodes is used both in mpnn.py and here)
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
-        
+
+        # Pass through encoder layers (exact order/inputs as in mpnn.py)
         for layer in self.model.encoder_layers:
             h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
-        
+
         for i, seq_len in enumerate(lengths):
             yield h_V[i, :seq_len].cpu()
 

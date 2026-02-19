@@ -219,7 +219,7 @@ class ProteinEncoder:
         self,
         proteins: ProteinEncoderInput,
         structures=None,
-        average_sequence: bool = True,  # actually average over tokens -> sequence embedding
+        average_sequence: bool = True,  # mean over residue dimension
         return_format: ReturnFormat = "torch",
     ):
         """
