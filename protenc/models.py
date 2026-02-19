@@ -5,7 +5,7 @@ import torch.nn as nn
 import attr
 import contextlib
 from collections import OrderedDict
-from typing import Callable
+from typing import Callable, List, Optional
 from enum import Enum
 from transformers import (
     BertModel,
@@ -20,7 +20,7 @@ import colorlog as logging
 import re
 from esm.models.esmc import ESMC, ESMCOutput
 from esm.models.esm3 import ESM3
-from esm.sdk.api import ESMProtein, ESMProteinTensor
+from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
 from esm.utils.structure.protein_chain import ProteinChain
 from esm.utils import encoding
 from esm.utils.sampling import _BatchedESMProteinTensor
@@ -202,6 +202,33 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
             yield token_representations[i, 1 : seq_len - 1]
 
 
+def _create_filtered_protein_complex(
+    pdb_path: str, chain_list: List[str], id: Optional[str] = None
+) -> ProteinComplex:
+    """
+    Load a ProteinComplex from a PDB file with only the specified chains.
+    Mirrors create_filtered_protein_complex from haipr/models/esm3.py.
+    """
+    chains = []
+    for chain_id in chain_list:
+        try:
+            chain = ProteinChain.from_pdb(pdb_path, chain_id=chain_id, id=id)
+            chains.append(chain)
+            logger.debug(
+                f"Successfully loaded chain {chain_id} with {len(chain.sequence)} residues"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load chain {chain_id} from PDB: {e}")
+            continue
+
+    if not chains:
+        raise ValueError(
+            f"No valid chains found for chain_list {chain_list} in PDB file {pdb_path}"
+        )
+
+    return ProteinComplex.from_chains(chains)
+
+
 class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
     """ESM3 embedding model that can handle sequences and structures."""
     embedding_kind = EmbeddingType.PER_RESIDUE
@@ -262,44 +289,97 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                     
             return protein_tensor
 
-    def prepare_sequences(self, sequences, structure_path=None):
+    def prepare_sequences(
+        self,
+        sequences: List[str],
+        structures=None,
+        chain_list: Optional[List[str]] = None,
+        structure_id: Optional[str] = None,
+    ):
         """
         Prepare sequences and structures for ESM3 embedding.
 
+        Encoding and structure handling mirror haipr/models/esm3.py:
+        - Uses ProteinComplex (full or filtered by chain_list with optional structure_id).
+        - When structure is present: tokenizes structure once with reference_sequence
+          from the first protein, shares structure tokens and coordinates across all
+          proteins, and builds one ESMProteinTensor per sequence with
+          encoding.tokenize_sequence / encoding.tokenize_structure.
+        - When no structure: encodes each sequence via model.encode (or _safe_encode).
+
         Args:
-            sequences: List of protein sequences
-            structure_path: Optional path to structure file for structure-aware encoding
+            sequences: List of protein sequences (may use "|" for multi-chain).
+            structures: Optional path to structure file for structure-aware encoding
+                (string or single-element list).
+            chain_list: Optional list of chain IDs to load (None = full complex).
+            structure_id: Optional structure id passed to ProteinChain.from_pdb when
+                loading by chain_list (mirrors id in haipr create_filtered_protein_complex).
 
         Returns:
-            List of ESMProteinTensor objects ready for embedding
+            List of ESMProteinTensor objects ready for embedding.
         """
-        # Create ESMProtein objects
-        proteins = [ESMProtein(sequence=seq) for seq in sequences]
-        
-        # Add structure information if provided
-        if structure_path is not None:
-            try:
-                # Load structure
-                chain = ProteinChain.from_pdb(structure_path)
-                protein_with_structure = ESMProtein.from_protein_chain(chain)
-                
-                # Tokenize structure once
-                coords, _, struct_tokens = encoding.tokenize_structure(
-                    protein_with_structure.coordinates,
+        structure_path = (
+            structures
+            if isinstance(structures, str)
+            else (structures[0] if structures else None)
+        )
+
+        if structure_path is None:
+            proteins = [ESMProtein(sequence=seq) for seq in sequences]
+            return [self._safe_encode(protein) for protein in proteins]
+
+        try:
+            if chain_list is not None:
+                pc = _create_filtered_protein_complex(
+                    structure_path, chain_list, id=structure_id
+                )
+            else:
+                pc = ProteinComplex.from_pdb(structure_path)
+
+            protein_with_structure = ESMProtein.from_protein_complex(pc)
+            shared_coordinates = protein_with_structure.coordinates
+
+            proteins = [
+                ESMProtein(sequence=seq, coordinates=shared_coordinates)
+                for seq in sequences
+            ]
+
+            first = proteins[0]
+            if first.coordinates is not None:
+                shared_coords, _, shared_structure_tokens = encoding.tokenize_structure(
+                    first.coordinates,
                     self._get_model().get_structure_encoder(),
                     structure_tokenizer=self._get_model().tokenizers.structure,
-                    reference_sequence="",
+                    reference_sequence=first.sequence or "",
                     add_special_tokens=True,
                 )
-                
-                # Add structure to all proteins
-                for protein in proteins:
-                    protein.coordinates = protein_with_structure.coordinates
-                    
-            except Exception as e:
-                logger.warning(f"Failed to load structure from {structure_path}: {e}")
+                protein_tensors = []
+                for p in proteins:
+                    sequence_tokens = encoding.tokenize_sequence(
+                        p.sequence or "",
+                        self._get_model().tokenizers.sequence,
+                        add_special_tokens=True,
+                    )
+                    if not isinstance(sequence_tokens, torch.Tensor):
+                        sequence_tokens = torch.tensor(
+                            sequence_tokens, dtype=torch.long
+                        )
+                    pt = ESMProteinTensor(
+                        sequence=sequence_tokens,
+                        structure=shared_structure_tokens,
+                        secondary_structure=None,
+                        sasa=None,
+                        function=None,
+                        residue_annotations=None,
+                        coordinates=shared_coords,
+                    )
+                    protein_tensors.append(pt)
+                return protein_tensors
 
-        # Encode all proteins
+        except Exception as e:
+            logger.warning(f"Failed to load structure from {structure_path}: {e}")
+
+        proteins = [ESMProtein(sequence=seq) for seq in sequences]
         return [self._safe_encode(protein) for protein in proteins]
 
     @torch.no_grad()
@@ -336,72 +416,10 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                 if hasattr(protein_tensor, 'coordinates') and protein_tensor.coordinates is not None:
                     inputs["structure_coords"] = protein_tensor.coordinates.to(device).unsqueeze(0)
 
-                # Run forward pass manually to avoid ESMOutput incompatibility with DataParallel
-                with (
-                    torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True)
-                    if device.type == "cuda"
-                    else contextlib.nullcontext()
-                ):
-                    # Extract required inputs
-                    sequence_tokens = inputs["sequence_tokens"]
-                    structure_tokens = inputs.get("structure_tokens", None)
-                    structure_coords = inputs.get("structure_coords", None)
-                    
-                    # Get model components
-                    if isinstance(self.model, torch.nn.DataParallel):
-                        encoder = self.model.module.encoder
-                        transformer = self.model.module.transformer
-                        tokenizers = self.model.module.tokenizers
-                    else:
-                        encoder = model.encoder
-                        transformer = model.transformer
-                        tokenizers = model.tokenizers
-                    
-                    # Set up defaults similar to ESM3.forward
-                    B, L = sequence_tokens.shape
-                    
-                    # Handle structure tokens
-                    if structure_tokens is None:
-                        from esm.utils.constants import esm3 as C
-                        structure_tokens = torch.full((B, L), C.STRUCTURE_MASK_TOKEN, dtype=torch.long, device=device)
-                    
-                    # Handle other required inputs with defaults
-                    ss8_tokens = torch.full((B, L), 8, dtype=torch.long, device=device)  # PAD token
-                    sasa_tokens = torch.full((B, L), 16, dtype=torch.long, device=device)  # PAD token
-                    function_tokens = torch.full((B, L, 8), 0, dtype=torch.long, device=device)  # PAD token
-                    residue_annotation_tokens = torch.full((B, L, 16), 0, dtype=torch.long, device=device)  # PAD token
-                    average_plddt = torch.ones((B, L), dtype=torch.float, device=device)
-                    per_res_plddt = torch.zeros((B, L), dtype=torch.float, device=device)
-                    chain_id = torch.zeros((B, L), dtype=torch.long, device=device)
-                    sequence_id = torch.zeros((B, L), dtype=torch.long, device=device)
-                    
-                    # Handle structure coordinates
-                    if structure_coords is None:
-                        structure_coords = torch.full((B, L, 3, 3), float("nan"), dtype=torch.float, device=device)
-                    
-                    # Build affine representation from coordinates
-                    from esm.utils.structure.affine3d import build_affine3d_from_coordinates
-                    structure_coords = structure_coords[..., :3, :]  # Ensure correct shape
-                    affine, affine_mask = build_affine3d_from_coordinates(structure_coords)
-                    
-                    # Run through encoder
-                    x = encoder(
-                        sequence_tokens,
-                        structure_tokens,
-                        average_plddt,
-                        per_res_plddt,
-                        ss8_tokens,
-                        sasa_tokens,
-                        function_tokens,
-                        residue_annotation_tokens,
-                    )
-                    
-                    # Run through transformer
-                    x, embeddings, _ = transformer(x, sequence_id, affine, affine_mask, chain_id)
-
-                    # Apply layer norm if requested
-                    if self.use_norm_layer and hasattr(transformer, 'norm'):
-                        embeddings = transformer.norm(embeddings)
+                # Run forward pass using the model directly
+                # internal forward handles normalization and other steps
+                output = model(**inputs)
+                embeddings = output.embeddings
 
                 # Remove batch dimension and special tokens
                 if len(embeddings.shape) == 3:
