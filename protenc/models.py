@@ -253,41 +253,6 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """Get the underlying model, handling DataParallel wrapping."""
         return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
 
-    def _safe_encode(self, protein: ESMProtein) -> ESMProteinTensor:
-        """
-        Encode an ESMProtein to ESMProteinTensor using the model's encode method.
-        """
-        if protein.sequence is None:
-            raise ValueError("sequence is required for encoding")
-
-        try:
-            return self._get_model().encode(protein)
-        except Exception as e:
-            logger.warning(f"Standard encoding failed: {e}. Using fallback encoding.")
-            
-            # Fallback: create tensor manually
-            sequence_tokenizer = self._get_model().tokenizers.sequence
-            sequence_tokens = sequence_tokenizer.encode(protein.sequence, add_special_tokens=True)
-            sequence_tokens = torch.tensor(sequence_tokens, dtype=torch.int64)
-            
-            protein_tensor = ESMProteinTensor(sequence=sequence_tokens)
-            
-            # Handle structure if provided
-            if protein.coordinates is not None:
-                try:
-                    coords, plddt, struct_tokens = encoding.tokenize_structure(
-                        protein.coordinates,
-                        self._get_model().get_structure_encoder(),
-                        structure_tokenizer=self._get_model().tokenizers.structure,
-                        reference_sequence=protein.sequence,
-                        add_special_tokens=True,
-                    )
-                    protein_tensor.coordinates = coords
-                    protein_tensor.structure = struct_tokens
-                except Exception as e:
-                    logger.warning(f"Failed to encode structure: {e}")
-                    
-            return protein_tensor
 
     def prepare_sequences(
         self,
@@ -338,10 +303,56 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
             protein_with_structure = ESMProtein.from_protein_complex(pc)
             shared_coordinates = protein_with_structure.coordinates
+            
+            # Align sequences to match the successfully loaded chains in ProteinComplex
+            aligned_sequences = []
+            try:
+                from biotite.structure.io.pdb import PDBFile
+                import biotite.structure as struc
+                
+                pdb_file = PDBFile.read(structure_path)
+                structure = pdb_file.get_structure()
+                models = structure[0] if hasattr(structure, "stack_depth") and structure.stack_depth() > 0 else structure
+                
+                # Get chain order from raw PDB
+                all_chain_ids = []
+                for cid in models.chain_id:
+                    if cid not in all_chain_ids:
+                        all_chain_ids.append(cid)
+                
+                loaded_chain_ids = [c.chain_id for c in pc.chain_iter()]
+                logger.debug(f"PDB chains: {all_chain_ids}, ProteinComplex loaded chains: {loaded_chain_ids}")
+                
+                for seq in sequences:
+                    parts = seq.split("|")
+                    if len(parts) == len(all_chain_ids):
+                        # Sequence has all chains from PDB
+                        chain_to_seq = dict(zip(all_chain_ids, parts))
+                        aligned_parts = []
+                        for chain in pc.chain_iter():
+                            cid = chain.chain_id
+                            seq_part = chain_to_seq.get(cid, "")
+                            if not seq_part:
+                                aligned_parts.append(str(chain.sequence))
+                            else:
+                                aligned_parts.append(seq_part)
+                        aligned_sequences.append("|".join(aligned_parts))
+                    elif len(parts) == len(loaded_chain_ids):
+                        # Sequence already perfectly matches loaded chains
+                        aligned_sequences.append(seq)
+                    else:
+                        logger.warning(
+                            f"Sequence parts ({len(parts)}) don't match PDB chains ({len(all_chain_ids)}) "
+                            f"or loaded chains ({len(loaded_chain_ids)}). Cannot align perfectly."
+                        )
+                        aligned_sequences.append(seq)
+            except Exception as e:
+                logger.warning(f"Failed to align sequences using biotite: {e}")
+                aligned_sequences = sequences
 
             proteins = [
                 ESMProtein(sequence=seq, coordinates=shared_coordinates)
-                for seq in sequences
+                for seq in aligned_sequences
             ]
 
             first = proteins[0]
@@ -435,7 +446,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                 logger.error(f"Error in forward pass: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-                raise
+                raise e
 
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
