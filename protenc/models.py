@@ -253,7 +253,6 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """Get the underlying model, handling DataParallel wrapping."""
         return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
 
-
     def prepare_sequences(
         self,
         sequences: List[str],
@@ -264,13 +263,10 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """
         Prepare sequences and structures for ESM3 embedding.
 
-        Encoding and structure handling mirror haipr/models/esm3.py:
-        - Uses ProteinComplex (full or filtered by chain_list with optional structure_id).
-        - When structure is present: tokenizes structure once with reference_sequence
-          from the first protein, shares structure tokens and coordinates across all
-          proteins, and builds one ESMProteinTensor per sequence with
-          encoding.tokenize_sequence / encoding.tokenize_structure.
-        - When no structure: encodes each sequence via model.encode (or _safe_encode).
+        Encoding and collation match haipr/models/esm3.py prepare_training_features
+        (without labels/cache): same sequence-only vs structure paths, tokenization,
+        and batched dict with sequence_tokens and optional structure_tokens.
+        All sequences in a batch must have the same length (stacked, no padding).
 
         Args:
             sequences: List of protein sequences (may use "|" for multi-chain).
@@ -281,172 +277,184 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                 loading by chain_list (mirrors id in haipr create_filtered_protein_complex).
 
         Returns:
-            List of ESMProteinTensor objects ready for embedding.
+            Dict with "sequence_tokens", optional "structure_tokens", for forward.
         """
+        logger.info(f"Preparing sequences for ESM3")
         structure_path = (
             structures
             if isinstance(structures, str)
             else (structures[0] if structures else None)
         )
+        use_structure = structure_path is not None
 
         if structure_path is None:
+            # Sequence-only path: like haipr - proteins then model.encode each
+            logger.info("Sequence-only path (use_structure=False)")
             proteins = [ESMProtein(sequence=seq) for seq in sequences]
-            return [self._safe_encode(protein) for protein in proteins]
-
-        try:
-            if chain_list is not None:
-                pc = _create_filtered_protein_complex(
-                    structure_path, chain_list, id=structure_id
-                )
-            else:
-                pc = ProteinComplex.from_pdb(structure_path)
-
-            protein_with_structure = ESMProtein.from_protein_complex(pc)
-            shared_coordinates = protein_with_structure.coordinates
-            
-            # Align sequences to match the successfully loaded chains in ProteinComplex
-            aligned_sequences = []
+            model = self._get_model()
+            protein_tensors = []
+            for p in proteins:
+                protein_tensors.append(model.encode(p))
+        else:
             try:
-                from biotite.structure.io.pdb import PDBFile
-                import biotite.structure as struc
-                
-                pdb_file = PDBFile.read(structure_path)
-                structure = pdb_file.get_structure()
-                models = structure[0] if hasattr(structure, "stack_depth") and structure.stack_depth() > 0 else structure
-                
-                # Get chain order from raw PDB
-                all_chain_ids = []
-                for cid in models.chain_id:
-                    if cid not in all_chain_ids:
-                        all_chain_ids.append(cid)
-                
-                loaded_chain_ids = [c.chain_id for c in pc.chain_iter()]
-                logger.debug(f"PDB chains: {all_chain_ids}, ProteinComplex loaded chains: {loaded_chain_ids}")
-                
-                for seq in sequences:
-                    parts = seq.split("|")
-                    if len(parts) == len(all_chain_ids):
-                        # Sequence has all chains from PDB
-                        chain_to_seq = dict(zip(all_chain_ids, parts))
-                        aligned_parts = []
-                        for chain in pc.chain_iter():
-                            cid = chain.chain_id
-                            seq_part = chain_to_seq.get(cid, "")
-                            if not seq_part:
-                                aligned_parts.append(str(chain.sequence))
-                            else:
-                                aligned_parts.append(seq_part)
-                        aligned_sequences.append("|".join(aligned_parts))
-                    elif len(parts) == len(loaded_chain_ids):
-                        # Sequence already perfectly matches loaded chains
-                        aligned_sequences.append(seq)
-                    else:
-                        logger.warning(
-                            f"Sequence parts ({len(parts)}) don't match PDB chains ({len(all_chain_ids)}) "
-                            f"or loaded chains ({len(loaded_chain_ids)}). Cannot align perfectly."
-                        )
-                        aligned_sequences.append(seq)
-            except Exception as e:
-                logger.warning(f"Failed to align sequences using biotite: {e}")
-                aligned_sequences = sequences
+                if chain_list is not None:
+                    pc = _create_filtered_protein_complex(
+                        structure_path, chain_list, id=structure_id
+                    )
+                else:
+                    pc = ProteinComplex.from_pdb(structure_path)
 
-            proteins = [
-                ESMProtein(sequence=seq, coordinates=shared_coordinates)
-                for seq in aligned_sequences
-            ]
+                protein_with_structure = ESMProtein.from_protein_complex(pc)
+                shared_coordinates = protein_with_structure.coordinates
 
-            first = proteins[0]
-            if first.coordinates is not None:
-                shared_coords, _, shared_structure_tokens = encoding.tokenize_structure(
-                    first.coordinates,
-                    self._get_model().get_structure_encoder(),
-                    structure_tokenizer=self._get_model().tokenizers.structure,
-                    reference_sequence=first.sequence or "",
-                    add_special_tokens=True,
-                )
-                protein_tensors = []
-                for p in proteins:
-                    sequence_tokens = encoding.tokenize_sequence(
-                        p.sequence or "",
-                        self._get_model().tokenizers.sequence,
+                # Align sequences to loaded chains (mirrors haipr chain_map logic)
+                aligned_sequences = []
+                try:
+                    from biotite.structure.io.pdb import PDBFile
+
+                    pdb_file = PDBFile.read(structure_path)
+                    structure = pdb_file.get_structure()
+                    models = (
+                        structure[0]
+                        if hasattr(structure, "stack_depth") and structure.stack_depth() > 0
+                        else structure
+                    )
+                    all_chain_ids = []
+                    for cid in models.chain_id:
+                        if cid not in all_chain_ids:
+                            all_chain_ids.append(cid)
+                    loaded_chain_ids = [c.chain_id for c in pc.chain_iter()]
+                    logger.debug(
+                        f"PDB chains: {all_chain_ids}, ProteinComplex loaded chains: {loaded_chain_ids}"
+                    )
+                    for seq in sequences:
+                        parts = seq.split("|")
+                        if len(parts) == len(all_chain_ids):
+                            chain_to_seq = dict(zip(all_chain_ids, parts))
+                            aligned_parts = []
+                            for chain in pc.chain_iter():
+                                cid = chain.chain_id
+                                seq_part = chain_to_seq.get(cid, "")
+                                aligned_parts.append(
+                                    seq_part if seq_part else str(chain.sequence)
+                                )
+                            aligned_sequences.append("|".join(aligned_parts))
+                        elif len(parts) == len(loaded_chain_ids):
+                            aligned_sequences.append(seq)
+                        else:
+                            logger.warning(
+                                f"Sequence parts ({len(parts)}) don't match PDB chains "
+                                f"({len(all_chain_ids)}) or loaded chains ({len(loaded_chain_ids)})."
+                            )
+                            aligned_sequences.append(seq)
+                except Exception as e:
+                    logger.warning(f"Failed to align sequences using biotite: {e}")
+                    aligned_sequences = sequences
+
+                proteins = [
+                    ESMProtein(sequence=seq, coordinates=shared_coordinates)
+                    for seq in aligned_sequences
+                ]
+                first = proteins[0]
+                if first.coordinates is None:
+                    model = self._get_model()
+                    protein_tensors = [model.encode(p) for p in proteins]
+                    use_structure = False
+                else:
+                    shared_coords, _, shared_structure_tokens = encoding.tokenize_structure(
+                        first.coordinates,
+                        self._get_model().get_structure_encoder(),
+                        structure_tokenizer=self._get_model().tokenizers.structure,
+                        reference_sequence=first.sequence or "",
                         add_special_tokens=True,
                     )
-                    if not isinstance(sequence_tokens, torch.Tensor):
-                        sequence_tokens = torch.tensor(
-                            sequence_tokens, dtype=torch.long
+                    protein_tensors = []
+                    for p in proteins:
+                        sequence_tokens = encoding.tokenize_sequence(
+                            p.sequence or "",
+                            self._get_model().tokenizers.sequence,
+                            add_special_tokens=True,
                         )
-                    pt = ESMProteinTensor(
-                        sequence=sequence_tokens,
-                        structure=shared_structure_tokens,
-                        secondary_structure=None,
-                        sasa=None,
-                        function=None,
-                        residue_annotations=None,
-                        coordinates=shared_coords,
-                    )
-                    protein_tensors.append(pt)
-                return protein_tensors
+                        if not isinstance(sequence_tokens, torch.Tensor):
+                            sequence_tokens = torch.tensor(
+                                sequence_tokens, dtype=torch.long
+                            )
+                        pt = ESMProteinTensor(
+                            sequence=sequence_tokens,
+                            structure=shared_structure_tokens,
+                            secondary_structure=None,
+                            sasa=None,
+                            function=None,
+                            residue_annotations=None,
+                            coordinates=shared_coords,
+                        )
+                        protein_tensors.append(pt)
+            except Exception as e:
+                logger.warning(f"Failed to load structure from {structure_path}: {e}")
+                proteins = [ESMProtein(sequence=seq) for seq in sequences]
+                model = self._get_model()
+                protein_tensors = [model.encode(p) for p in proteins]
+                use_structure = False
 
-        except Exception as e:
-            logger.warning(f"Failed to load structure from {structure_path}: {e}")
+        # Collate like haipr prepare_training_features: sequence_tokens_list, structure_tokens_list
+        sequence_tokens_list = []
+        structure_tokens_list = []
+        for p in protein_tensors:
+            seq_tok = (
+                p.sequence.cpu()
+                if isinstance(p.sequence, torch.Tensor) and p.sequence.is_cuda
+                else p.sequence
+            )
+            struct_tok = (
+                p.structure.cpu()
+                if isinstance(p.structure, torch.Tensor) and p.structure.is_cuda
+                else p.structure
+            )
+            sequence_tokens_list.append(seq_tok)
+            structure_tokens_list.append(struct_tok)
 
-        proteins = [ESMProtein(sequence=seq) for seq in sequences]
-        return [self._safe_encode(protein) for protein in proteins]
+        if use_structure:
+            inputs_for_model = {
+                "sequence_tokens": torch.stack(sequence_tokens_list),
+                "structure_tokens": torch.stack(structure_tokens_list),
+            }
+        else:
+            inputs_for_model = {
+                "sequence_tokens": torch.stack(sequence_tokens_list),
+            }
+        return {k: v for k, v in inputs_for_model.items() if v is not None}
 
     @torch.no_grad()
     def forward(self, input):
         """
         Generate embeddings for the input sequences.
 
+        Mirrors haipr/models/esm3.py forward: model(**batch["inputs"]) then use
+        output.embeddings. Yields per-sequence embeddings (BOS/EOS stripped).
+
         Args:
-            input: List of ESMProteinTensor objects
+            input: Dict from prepare_sequences with "sequence_tokens" and
+                optional "structure_tokens" (same-length batch, no padding).
 
         Yields:
-            Embeddings for each sequence (without special tokens)
+            Embeddings for each sequence (per-residue, without special tokens).
         """
         device = next(self.model.parameters()).device
         model = self._get_model()
 
-        for protein_tensor in input:
-            try:
-                # Move to device and prepare input
-                protein_tensor = attr.evolve(protein_tensor)
-                
-                # Prepare inputs for forward pass
-                inputs = {}
-                
-                # Always include sequence
-                if protein_tensor.sequence is not None:
-                    inputs["sequence_tokens"] = protein_tensor.sequence.to(device).unsqueeze(0)
-                
-                # Include structure if available
-                if hasattr(protein_tensor, 'structure') and protein_tensor.structure is not None:
-                    inputs["structure_tokens"] = protein_tensor.structure.to(device).unsqueeze(0)
-                
-                # Include coordinates if available
-                if hasattr(protein_tensor, 'coordinates') and protein_tensor.coordinates is not None:
-                    inputs["structure_coords"] = protein_tensor.coordinates.to(device).unsqueeze(0)
+        inputs = {"sequence_tokens": input["sequence_tokens"].to(device)}
+        if "structure_tokens" in input and input["structure_tokens"] is not None:
+            inputs["structure_tokens"] = input["structure_tokens"].to(device)
+        inputs = {k: v for k, v in inputs.items() if v is not None}
 
-                # Run forward pass using the model directly
-                # internal forward handles normalization and other steps
-                output = model(**inputs)
-                embeddings = output.embeddings
+        output = model(**inputs)
+        embeddings = output.embeddings
+        if embeddings.dtype == torch.bfloat16:
+            embeddings = embeddings.float()
 
-                # Remove batch dimension and special tokens
-                if len(embeddings.shape) == 3:
-                    # [batch_size, seq_len, hidden_dim] -> [seq_len, hidden_dim]
-                    embeddings = embeddings[0, 1:-1]
-                else:
-                    # [seq_len, hidden_dim]
-                    embeddings = embeddings[1:-1]
-
-                yield embeddings.cpu()
-
-            except Exception as e:
-                logger.error(f"Error in forward pass: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                raise e
+        batch_size = embeddings.shape[0]
+        for i in range(batch_size):
+            yield embeddings[i, 1:-1].cpu()
 
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):

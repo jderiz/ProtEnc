@@ -3,6 +3,7 @@ import torch.nn as nn
 import protenc.utils as utils
 
 from functools import cached_property
+from tqdm import tqdm
 from protenc.types import BatchSize, ProteinEncoderInput, ReturnFormat
 from torch.utils.data import DataLoader
 from protenc.models import BaseProteinEmbeddingModel, get_model
@@ -235,22 +236,23 @@ class ProteinEncoder:
             Embeddings for each protein in the requested format
         """
         if isinstance(proteins, dict):
-            yield from zip(
-                proteins.keys(),
-                self.encode(
-                    list(proteins.values()),
-                    structures=structures,
-                    average_sequence=average_sequence,
-                    return_format=return_format,
-                ),
+            gen = self._encode_batches(
+                list(proteins.values()),
+                structures=structures,
+                average_sequence=average_sequence,
+                return_format=return_format,
             )
+            for key, emb in zip(proteins.keys(), tqdm(gen, total=len(proteins), desc="Embedding")):
+                yield key, emb
         elif isinstance(proteins, list):
-            yield from self._encode_batches(
+            gen = self._encode_batches(
                 proteins,
                 structures=structures,
                 average_sequence=average_sequence,
                 return_format=return_format,
             )
+            for emb in tqdm(gen, total=len(proteins), desc="Embedding"):
+                yield emb
         else:
             raise TypeError(
                 "Expected list of proteins sequences or dictionary with protein "

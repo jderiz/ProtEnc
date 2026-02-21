@@ -1,4 +1,5 @@
 import pytest
+import torch
 from protenc.models import get_model, get_model_info
 from .utils import list_models_to_test, skip_no_gpu
 
@@ -14,7 +15,14 @@ def test_protein_language_model(
     model = get_model(model_name).to(device)
     model_info = get_model_info(model_name)
 
-    batch = model.prepare_sequences(proteins).to(device)
+    batch = model.prepare_sequences(proteins)
+    if isinstance(batch, dict):
+        batch = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+    else:
+        batch = batch.to(device)
     embeds = list(model(batch))
     
     for prot, embed in zip(proteins, embeds):
