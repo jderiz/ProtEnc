@@ -4,6 +4,7 @@ import pickle
 import numpy as np
 import lmdb
 import os
+import h5py
 
 from Bio import SeqIO
 from csv import DictReader
@@ -217,6 +218,70 @@ class LMDBWriter(BaseOutputWriter):
         env.close()
 
 
+class HDF5Writer(BaseOutputWriter):
+    def __init__(self, path, **hdf5_kwargs):
+        self.path = path
+        self.hdf5_kwargs = hdf5_kwargs
+        self.file = None
+        self.counter = 0
+
+    @staticmethod
+    def add_arguments_to_parser(parser: argparse.ArgumentParser):
+        parser.add_argument("--hdf5_writer.compression", default="gzip")
+        parser.add_argument("--hdf5_writer.compression_opts", type=int, default=9)
+        parser.add_argument("--hdf5_writer.chunks", action="store_true")
+
+    @classmethod
+    def from_args(cls, path, args):
+        return cls(
+            path,
+            compression=getattr(args.hdf5_writer, "compression", "gzip"),
+            compression_opts=getattr(args.hdf5_writer, "compression_opts", 9),
+            chunks=getattr(args.hdf5_writer, "chunks", True),
+        )
+
+    def _callback(self, label, embedding):
+        assert self.file is not None
+        assert isinstance(label, str) and isinstance(embedding, np.ndarray)
+
+        try:
+            # Create a dataset for this embedding
+            dataset_name = f"embeddings/{label}"
+            self.file.create_dataset(
+                dataset_name,
+                data=embedding,
+                compression=self.hdf5_kwargs.get("compression", "gzip"),
+                compression_opts=self.hdf5_kwargs.get("compression_opts", 9),
+                chunks=self.hdf5_kwargs.get("chunks", True)
+            )
+            self.counter += 1
+            
+            if self.counter % 1000 == 0:
+                logger.info(f"Saved {self.counter} embeddings to HDF5")
+                
+        except Exception as e:
+            logger.error(f"Error saving embedding {label}: {e}")
+            raise
+
+    def __enter__(self) -> Callable[[str, np.ndarray], None]:
+        if self.file is None:
+            logger.debug(f"Opening HDF5 file: {self.path}")
+            try:
+                self.file = h5py.File(str(self.path), 'w')
+            except Exception as e:
+                msg = f"Could not create HDF5 file {self.path}: {e}"
+                logger.error(msg)
+                raise FileNotFoundError(msg)
+
+        return self._callback
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.file is not None:
+            logger.info(f"Closing HDF5 file with {self.counter} embeddings")
+            self.file.close()
+            self.file = None
+
+
 input_format_mapping = {"csv": CSVReader, "json": JSONReader, "fasta": FASTAReader}
 
-output_format_mapping = {"lmdb": LMDBWriter}
+output_format_mapping = {"lmdb": LMDBWriter, "hdf5": HDF5Writer}
