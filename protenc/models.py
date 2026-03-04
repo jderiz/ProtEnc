@@ -1,9 +1,8 @@
 from dataclasses import dataclass
+import contextlib
 import os
 import torch
 import torch.nn as nn
-import attr
-import contextlib
 from collections import OrderedDict
 from typing import Callable, List, Optional
 from enum import Enum
@@ -22,7 +21,6 @@ from esm.models.esmc import ESMC, ESMCOutput
 from esm.models.esm3 import ESM3
 from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
 from esm.utils.structure.protein_chain import ProteinChain
-from esm.utils import encoding
 from esm.utils.sampling import _BatchedESMProteinTensor
 from esm.utils.generation import _batch_forward
 
@@ -200,7 +198,7 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         seq_lengths = input["attention_mask"].sum(1)
 
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, 1 : seq_len - 1]
+            yield token_representations[i, 1: seq_len - 1]
 
 
 def _create_filtered_protein_complex(
@@ -231,8 +229,10 @@ def _create_filtered_protein_complex(
 
 
 class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
+    """ESM3 embedder; batches must contain sequences of the same length (no padding)."""
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
+    requires_same_length_batch = True
 
     def __init__(self, model_name: str, use_norm_layer: bool = True):
         super().__init__()
@@ -254,10 +254,10 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """
         Prepare sequences and structures for ESM3 embedding.
 
-        Encoding and collation match haipr/models/esm3.py prepare_training_features
-        (without labels/cache): same sequence-only vs structure paths, tokenization,
-        and batched dict with sequence_tokens and optional structure_tokens.
-        All sequences in a batch must have the same length (stacked, no padding).
+        Uses default ESM3 model.encode() for tokenization in both sequence-only and
+        sequence+structure paths. Collation yields a batched dict with sequence_tokens
+        and optional structure_tokens for forward. All sequences in a batch must have
+        the same length (stacked, no padding).
 
         Args:
             sequences: List of protein sequences (may use "|" for multi-chain).
@@ -277,15 +277,13 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             else (structures[0] if structures else None)
         )
         use_structure = structure_path is not None
+        model = self._get_model()
 
         if structure_path is None:
-            # Sequence-only path: like haipr - proteins then model.encode each
+            # Sequence-only: ESMProtein(sequence=...) then default model.encode()
             logger.info("Sequence-only path (use_structure=False)")
             proteins = [ESMProtein(sequence=seq) for seq in sequences]
-            model = self._get_model()
-            protein_tensors = []
-            for p in proteins:
-                protein_tensors.append(model.encode(p))
+            protein_tensors = [model.encode(p) for p in proteins]
         else:
             try:
                 if chain_list is not None:
@@ -348,38 +346,11 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                 ]
                 first = proteins[0]
                 if first.coordinates is None:
-                    model = self._get_model()
                     protein_tensors = [model.encode(p) for p in proteins]
                     use_structure = False
                 else:
-                    shared_coords, _, shared_structure_tokens = encoding.tokenize_structure(
-                        first.coordinates,
-                        self._get_model().get_structure_encoder(),
-                        structure_tokenizer=self._get_model().tokenizers.structure,
-                        reference_sequence=first.sequence or "",
-                        add_special_tokens=True,
-                    )
-                    protein_tensors = []
-                    for p in proteins:
-                        sequence_tokens = encoding.tokenize_sequence(
-                            p.sequence or "",
-                            self._get_model().tokenizers.sequence,
-                            add_special_tokens=True,
-                        )
-                        if not isinstance(sequence_tokens, torch.Tensor):
-                            sequence_tokens = torch.tensor(
-                                sequence_tokens, dtype=torch.long
-                            )
-                        pt = ESMProteinTensor(
-                            sequence=sequence_tokens,
-                            structure=shared_structure_tokens,
-                            secondary_structure=None,
-                            sasa=None,
-                            function=None,
-                            residue_annotations=None,
-                            coordinates=shared_coords,
-                        )
-                        protein_tensors.append(pt)
+                    # Use default ESM3 tokenization for sequence and structure
+                    protein_tensors = [model.encode(p) for p in proteins]
             except Exception as e:
                 logger.warning(f"Failed to load structure from {structure_path}: {e}")
                 proteins = [ESMProtein(sequence=seq) for seq in sequences]
@@ -420,8 +391,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """
         Generate embeddings for the input sequences.
 
-        Mirrors haipr/models/esm3.py forward: model(**batch["inputs"]) then use
-        output.embeddings. Yields per-sequence embeddings (BOS/EOS stripped).
+        Uses model(**inputs) then output.embeddings. Yields per-sequence embeddings
+        (BOS/EOS stripped). Supports sequence-only or sequence+structure batches.
 
         Args:
             input: Dict from prepare_sequences with "sequence_tokens" and
@@ -438,7 +409,13 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             inputs["structure_tokens"] = input["structure_tokens"].to(device)
         inputs = {k: v for k, v in inputs.items() if v is not None}
 
-        output = model(**inputs)
+        # ESM3 is often bfloat16; run forward under autocast to avoid Float/BFloat16 mismatch
+        with (
+            torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        ):
+            output = model(**inputs)
         embeddings = output.embeddings
         if embeddings.dtype == torch.bfloat16:
             embeddings = embeddings.float()
