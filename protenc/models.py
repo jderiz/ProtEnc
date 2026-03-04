@@ -313,7 +313,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                                 cid = chain.chain_id
                                 seq_part = chain_to_seq.get(cid, "")
                                 aligned_parts.append(
-                                    seq_part if seq_part else str(chain.sequence)
+                                    seq_part if seq_part else str(
+                                        chain.sequence)
                                 )
                             aligned_sequences.append("|".join(aligned_parts))
                         elif len(parts) == len(loaded_chain_ids):
@@ -325,7 +326,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                             )
                             aligned_sequences.append(seq)
                 except Exception as e:
-                    logger.warning(f"Failed to align sequences using biotite: {e}")
+                    logger.warning(
+                        f"Failed to align sequences using biotite: {e}")
                     aligned_sequences = sequences
 
                 proteins = [
@@ -527,7 +529,8 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
             pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
         else:
             # List of PDB paths: use first for structure, batch from all if no sequences
-            pdb_dict_list = parse_PDB(structures[0], ca_only=self.ca_only) if structures else []
+            pdb_dict_list = parse_PDB(
+                structures[0], ca_only=self.ca_only) if structures else []
         logger.debug(f"pdb_dict_list: {len(pdb_dict_list)}")
         if not pdb_dict_list:
             raise ValueError(
@@ -537,7 +540,8 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         pdb_dict = pdb_dict_list[0]
         pdb_seq_len = len(pdb_dict.get("seq", ""))
 
-        chain_keys = [key for key in pdb_dict.keys() if key.startswith("seq_chain_")]
+        chain_keys = [key for key in pdb_dict.keys(
+        ) if key.startswith("seq_chain_")]
         chain_letters = [key.replace("seq_chain_", "") for key in chain_keys]
 
         if sequences:
@@ -557,7 +561,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
                         chain_key = f"seq_chain_{letter}"
                         if chain_key in pdb_dict:
                             chain_len = len(pdb_dict[chain_key])
-                            seq_dict[chain_key] = seq[start_idx : start_idx + chain_len]
+                            seq_dict[chain_key] = seq[start_idx: start_idx + chain_len]
                             start_idx += chain_len
                 batch.append(seq_dict)
         elif not isinstance(structures, str) and structures:
@@ -605,7 +609,8 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         chain_encoding_all = input['chain_encoding_all'].to(device)
         lengths = input['lengths']
 
-        E, E_idx = self.model.features(X, mask, residue_idx, chain_encoding_all)
+        E, E_idx = self.model.features(
+            X, mask, residue_idx, chain_encoding_all)
         h_S = self.model.W_s(S)
         h_V = h_S.clone()
         h_E = self.model.W_e(E)
@@ -638,7 +643,7 @@ class ModelCard:
 
 
 model_descriptions = [
-    
+
     ModelCard.from_model_cls(
         name="carp",
         family="CARP",
@@ -646,7 +651,7 @@ model_descriptions = [
         model_cls=CarpEmbeddingModel,
         model_kwargs=dict(model_name="carp_640M", repr_layer=56),
     ),
-    
+
     ModelCard.from_model_cls(
         name="prot_t5_xl_uniref50",
         family="ProtTrans",
@@ -689,7 +694,7 @@ model_descriptions = [
         model_cls=ProtBERTEmbeddingModel,
         model_kwargs=dict(model_name="prot_bert"),
     ),
-    
+
     ModelCard.from_model_cls(
         name="esm2_t48",
         family="ESM",
@@ -732,7 +737,7 @@ model_descriptions = [
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t6_8M_UR50D", repr_layer=6),
     ),
-    
+
     ModelCard.from_model_cls(
         name="esmc_600m",
         family="ESM",
@@ -754,7 +759,7 @@ model_descriptions = [
         model_cls=ESM3EmbeddingModel,
         model_kwargs=dict(model_name="esm3_sm_open_v1", use_norm_layer=True),
     ),
-    
+
     ModelCard.from_model_cls(
         name="mpnn",
         family="ProteinMPNN",
