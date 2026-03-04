@@ -39,6 +39,7 @@ class ProteinEncoder:
         """
         self.model = model
         self.batch_size = 1 if batch_size is None else batch_size
+        self._same_length_batch = getattr(model, "requires_same_length_batch", False)
         self.autocast = autocast  # Automatic mixed precision, saves memory and time at little accuracy cost
         self.preprocess_workers = preprocess_workers
         self.dataloader = dataloader
@@ -140,21 +141,24 @@ class ProteinEncoder:
 
         return issues
 
-    def _get_data_loader(self, proteins: list[str], structures=None):
-        assert isinstance(
-            self.batch_size, int
-        ), "batch size must be provided as integer at the moment"
-
-        # Always pass structures to models - they can decide whether to use them
-        def collate_fn(batch):
-            return self.prepare_sequences([p for p in batch], structures)
-
-        return self.dataloader(
-            proteins,
-            collate_fn=collate_fn,
-            batch_size=self.batch_size,
-            num_workers=self.preprocess_workers,
-        )
+    def _iter_batches(self, proteins: list[str]):
+        """Iterate (batch_indices, batch_sequences). Same-length models: group by length then chunk; else consecutive chunks."""
+        assert isinstance(self.batch_size, int), "batch size must be an integer"
+        n = len(proteins)
+        if self._same_length_batch:
+            from collections import defaultdict
+            by_len = defaultdict(list)
+            for i, p in enumerate(proteins):
+                by_len[len(p)].append(i)
+            for _length in sorted(by_len.keys()):
+                indices_L = by_len[_length]
+                for start in range(0, len(indices_L), self.batch_size):
+                    chunk = indices_L[start : start + self.batch_size]
+                    yield chunk, [proteins[j] for j in chunk]
+        else:
+            for start in range(0, n, self.batch_size):
+                chunk = list(range(start, min(start + self.batch_size, n)))
+                yield chunk, [proteins[j] for j in chunk]
 
     def prepare_sequences(self, proteins: list[str], structures=None):
         """Prepare protein sequences for encoding, optionally with structures."""
@@ -190,31 +194,125 @@ class ProteinEncoder:
         average_sequence: bool = False,
         return_format: ReturnFormat = "torch",
     ):
-        """Process proteins in batches and yield embeddings."""
-        batches = self._get_data_loader(proteins, structures)
+        """
+        Flow for all models: 1) prepare_sequences (tokenization), 2) batch-wise forward.
+        Yields (index, embed) so the consumer can write to disk by index (streamed).
+        """
+        target_device = self._get_primary_device()
 
-        for batch in batches:
-            # Move batch to device
-            target_device = self._get_primary_device()
-            if isinstance(batch, dict):
-                # Move tensors to device
-                batch = {
-                    k: v.to(target_device) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
-            elif isinstance(batch, list):
-                # Handle list of tensors
-                batch = [b.to(target_device) if hasattr(b, "to") else b for b in batch]
-            else:
-                batch = batch.to(target_device)
+        if self._same_length_batch:
+            # Phase 1: prepare_sequences for all sequences; Phase 2: forward in batches
+            yield from self._encode_two_phase(
+                proteins, structures, average_sequence, return_format, target_device
+            )
+            return
 
-                # Handle model output (generators that yield embeddings)
-            model_output = self._encode(batch)
+        # Phase 1 + 2 per batch: prepare_sequences then forward; two progress bars
+        n = len(proteins)
+        pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
+        pbar_embed = tqdm(total=n, desc="Embedding", unit="seq")
+        try:
+            for batch_indices, batch_sequences in self._iter_batches(proteins):
+                batch = self.prepare_sequences(batch_sequences, structures)
+                pbar_prepare.update(len(batch_indices))
+                batch = self._batch_to_device(batch, target_device)
+                model_output = self._encode(batch)
+                try:
+                    for i, embed in enumerate(model_output):
+                        if average_sequence:
+                            embed = embed.mean(0)
+                        out = utils.to_return_format(embed.cpu(), return_format)
+                        del embed
+                        yield (batch_indices[i], out)
+                        pbar_embed.update(1)
+                finally:
+                    del model_output
+                    del batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        finally:
+            pbar_prepare.close()
+            pbar_embed.close()
 
-            for embed in model_output:
-                if average_sequence:
-                    embed = embed.mean(0)
-                yield utils.to_return_format(embed.cpu(), return_format)
+    def _batch_to_device(self, batch, target_device: torch.device):
+        """Move batch tensors to device (dict, list, or single tensor)."""
+        if isinstance(batch, dict):
+            return {
+                k: v.to(target_device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+        if isinstance(batch, list):
+            return [b.to(target_device) if hasattr(b, "to") else b for b in batch]
+        return batch.to(target_device)
+
+    def _encode_two_phase(
+        self,
+        proteins: list[str],
+        structures,
+        average_sequence: bool,
+        return_format: ReturnFormat,
+        target_device: torch.device,
+    ):
+        """Phase 1: prepare_sequences for all sequences. Phase 2: forward in batches. Yields (index, embed)."""
+        from collections import defaultdict
+
+        by_len = defaultdict(list)
+        for i, p in enumerate(proteins):
+            by_len[len(p)].append(i)
+
+        n = len(proteins)
+        pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
+        # Phase 1: prepare_sequences for all (chunked by length group)
+        tokenized_by_idx = {}
+        try:
+            for _length in sorted(by_len.keys()):
+                indices_L = by_len[_length]
+                for start in range(0, len(indices_L), self.batch_size):
+                    chunk_indices = indices_L[start : start + self.batch_size]
+                    chunk_sequences = [proteins[j] for j in chunk_indices]
+                    batch_dict = self.prepare_sequences(chunk_sequences, structures)
+                    pbar_prepare.update(len(chunk_indices))
+                    for k, idx in enumerate(chunk_indices):
+                        seq_t = batch_dict["sequence_tokens"][k]
+                        struct_t = (
+                            batch_dict["structure_tokens"][k]
+                            if "structure_tokens" in batch_dict
+                            and batch_dict["structure_tokens"] is not None
+                            else None
+                        )
+                        tokenized_by_idx[idx] = (seq_t, struct_t)
+        finally:
+            pbar_prepare.close()
+
+        pbar_embed = tqdm(total=n, desc="Embedding", unit="seq")
+        # Phase 2: forward in batches, yield (index, embed)
+        try:
+            for _length in sorted(by_len.keys()):
+                indices_L = by_len[_length]
+                for start in range(0, len(indices_L), self.batch_size):
+                    batch_indices = indices_L[start : start + self.batch_size]
+                    seq_list = [tokenized_by_idx[i][0] for i in batch_indices]
+                    struct_list = [tokenized_by_idx[i][1] for i in batch_indices]
+                    batch = {"sequence_tokens": torch.stack(seq_list)}
+                    if struct_list[0] is not None:
+                        batch["structure_tokens"] = torch.stack(struct_list)
+                    batch = self._batch_to_device(batch, target_device)
+                    model_output = self._encode(batch)
+                    try:
+                        for i, embed in enumerate(model_output):
+                            if average_sequence:
+                                embed = embed.mean(0)
+                            out = utils.to_return_format(embed.cpu(), return_format)
+                            del embed
+                            yield (batch_indices[i], out)
+                            pbar_embed.update(1)
+                    finally:
+                        del model_output
+                        del batch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+        finally:
+            pbar_embed.close()
 
     def encode(
         self,
@@ -236,14 +334,16 @@ class ProteinEncoder:
             Embeddings for each protein in the requested format
         """
         if isinstance(proteins, dict):
+            keys = list(proteins.keys())
+            seqs = list(proteins.values())
             gen = self._encode_batches(
-                list(proteins.values()),
+                seqs,
                 structures=structures,
                 average_sequence=average_sequence,
                 return_format=return_format,
             )
-            for key, emb in zip(proteins.keys(), tqdm(gen, total=len(proteins), desc="Embedding")):
-                yield key, emb
+            for _idx, emb in gen:
+                yield keys[_idx], emb
         elif isinstance(proteins, list):
             gen = self._encode_batches(
                 proteins,
@@ -251,8 +351,8 @@ class ProteinEncoder:
                 average_sequence=average_sequence,
                 return_format=return_format,
             )
-            for emb in tqdm(gen, total=len(proteins), desc="Embedding"):
-                yield emb
+            for item in gen:
+                yield item  # (index, embed) for streamed write-by-index
         else:
             raise TypeError(
                 "Expected list of proteins sequences or dictionary with protein "

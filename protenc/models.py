@@ -1,9 +1,8 @@
 from dataclasses import dataclass
+import contextlib
 import os
 import torch
 import torch.nn as nn
-import attr
-import contextlib
 from collections import OrderedDict
 from typing import Callable, List, Optional
 from enum import Enum
@@ -22,7 +21,6 @@ from esm.models.esmc import ESMC, ESMCOutput
 from esm.models.esm3 import ESM3
 from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
 from esm.utils.structure.protein_chain import ProteinChain
-from esm.utils import encoding
 from esm.utils.sampling import _BatchedESMProteinTensor
 from esm.utils.generation import _batch_forward
 
@@ -83,10 +81,10 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         ), f"Unknown model name '{model_name}'. Available options are {self.available_models}"
 
     def prepare_sequences(self, sequences, structures=None):
-        # ProtTrans tokenizers expect whitespaces between residues
+        
         sequences = [" ".join(s.replace(" ", "")) for s in sequences]
 
-        # Simply return the encoded sequences without TensorDict
+        
         return self.tokenizer.batch_encode_plus(
             sequences, return_tensors="pt", add_special_tokens=True, padding=True
         )
@@ -104,11 +102,11 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         seq_lens = (attn_mask == 1).sum(-1)
 
         for embed, seq_len in zip(embeddings, seq_lens):
-            # Tokenized sequences have the following form:
-            # [CLS] V N ... I K [SEP] [PAD] ... [PAD]
-            #
-            # We remove the special tokens ([CLS], [SEP], [PAD]) before
-            # computing the mean over the remaining sequence
+            
+            
+            
+            
+            
 
             yield self._post_process_embedding(embed, seq_len)
 
@@ -128,7 +126,7 @@ class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
         super().__init__(model=model, tokenizer=tokenizer)
 
     def _post_process_embedding(self, embed, seq_len):
-        return embed[1 : seq_len - 1]
+        return embed[1: seq_len - 1]
 
 
 class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
@@ -162,32 +160,33 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         super().__init__()
 
         self.model = EsmModel.from_pretrained("facebook/" + model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained("facebook/" + model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "facebook/" + model_name)
 
-        # self.model, self.alphabet = torch.hub.load(
-        #     "facebookresearch/esm:main", model_name
-        # )
+        
+        
+        
         self.model.eval()
-        # self.batch_converter = self.alphabet.get_batch_converter()
+        
         self.repr_layer = repr_layer
 
     def clean(self, seq):
         if not re.match(r"^[ACDEFGHIKLMNPQRSTVWYX]+$", seq):
             print(f"Invalid sequence: {seq}")
-            # convert unknown characters to X
+            
             seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWYX]", "X", seq)
             print(f"Converted sequence: {seq}")
         return seq
 
     def prepare_sequences(self, sequences, structures=None):
-        # _, _, batch_tokens = self.batch_converter(
-        #     [("", self.clean(seq)) for seq in sequences]
-        # )
+        
+        
+        
         batch_tokens = self.tokenizer(
             sequences, return_tensors="pt", add_special_tokens=True, padding=True
         )
 
-        # Simply return a dictionary with the tokens
+        
         return batch_tokens
 
     @torch.no_grad()
@@ -195,11 +194,11 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         logger.debug(f"Input: {input}")
         results = self.model(**input, output_hidden_states=False)
         token_representations = results["last_hidden_state"]
-        # token_representations = results["hidden_states"][self.repr_layer]
+        
         seq_lengths = input["attention_mask"].sum(1)
 
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, 1 : seq_len - 1]
+            yield token_representations[i, 1: seq_len - 1]
 
 
 def _create_filtered_protein_complex(
@@ -230,19 +229,12 @@ def _create_filtered_protein_complex(
 
 
 class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
-    """ESM3 embedding model that can handle sequences and structures."""
+    """ESM3 embedder; batches must contain sequences of the same length (no padding)."""
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
+    requires_same_length_batch = True
 
     def __init__(self, model_name: str, use_norm_layer: bool = True):
-        """
-        Initialize the ESM3 embedding model.
-
-        Args:
-            model_name: Name of the ESM3 model to use
-            use_norm_layer: Whether to use the normalized embeddings (transformer.norm applied)
-                           or raw embeddings from the model
-        """
         super().__init__()
         self.model: ESM3 = ESM3.from_pretrained(model_name)
         self.model.eval()
@@ -250,7 +242,6 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         self.model_name = model_name
 
     def _get_model(self):
-        """Get the underlying model, handling DataParallel wrapping."""
         return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
 
     def prepare_sequences(
@@ -263,10 +254,10 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """
         Prepare sequences and structures for ESM3 embedding.
 
-        Encoding and collation match haipr/models/esm3.py prepare_training_features
-        (without labels/cache): same sequence-only vs structure paths, tokenization,
-        and batched dict with sequence_tokens and optional structure_tokens.
-        All sequences in a batch must have the same length (stacked, no padding).
+        Uses default ESM3 model.encode() for tokenization in both sequence-only and
+        sequence+structure paths. Collation yields a batched dict with sequence_tokens
+        and optional structure_tokens for forward. All sequences in a batch must have
+        the same length (stacked, no padding).
 
         Args:
             sequences: List of protein sequences (may use "|" for multi-chain).
@@ -286,15 +277,13 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             else (structures[0] if structures else None)
         )
         use_structure = structure_path is not None
+        model = self._get_model()
 
         if structure_path is None:
-            # Sequence-only path: like haipr - proteins then model.encode each
+            # Sequence-only: ESMProtein(sequence=...) then default model.encode()
             logger.info("Sequence-only path (use_structure=False)")
             proteins = [ESMProtein(sequence=seq) for seq in sequences]
-            model = self._get_model()
-            protein_tensors = []
-            for p in proteins:
-                protein_tensors.append(model.encode(p))
+            protein_tensors = [model.encode(p) for p in proteins]
         else:
             try:
                 if chain_list is not None:
@@ -357,38 +346,11 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                 ]
                 first = proteins[0]
                 if first.coordinates is None:
-                    model = self._get_model()
                     protein_tensors = [model.encode(p) for p in proteins]
                     use_structure = False
                 else:
-                    shared_coords, _, shared_structure_tokens = encoding.tokenize_structure(
-                        first.coordinates,
-                        self._get_model().get_structure_encoder(),
-                        structure_tokenizer=self._get_model().tokenizers.structure,
-                        reference_sequence=first.sequence or "",
-                        add_special_tokens=True,
-                    )
-                    protein_tensors = []
-                    for p in proteins:
-                        sequence_tokens = encoding.tokenize_sequence(
-                            p.sequence or "",
-                            self._get_model().tokenizers.sequence,
-                            add_special_tokens=True,
-                        )
-                        if not isinstance(sequence_tokens, torch.Tensor):
-                            sequence_tokens = torch.tensor(
-                                sequence_tokens, dtype=torch.long
-                            )
-                        pt = ESMProteinTensor(
-                            sequence=sequence_tokens,
-                            structure=shared_structure_tokens,
-                            secondary_structure=None,
-                            sasa=None,
-                            function=None,
-                            residue_annotations=None,
-                            coordinates=shared_coords,
-                        )
-                        protein_tensors.append(pt)
+                    # Use default ESM3 tokenization for sequence and structure
+                    protein_tensors = [model.encode(p) for p in proteins]
             except Exception as e:
                 logger.warning(f"Failed to load structure from {structure_path}: {e}")
                 proteins = [ESMProtein(sequence=seq) for seq in sequences]
@@ -429,8 +391,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """
         Generate embeddings for the input sequences.
 
-        Mirrors haipr/models/esm3.py forward: model(**batch["inputs"]) then use
-        output.embeddings. Yields per-sequence embeddings (BOS/EOS stripped).
+        Uses model(**inputs) then output.embeddings. Yields per-sequence embeddings
+        (BOS/EOS stripped). Supports sequence-only or sequence+structure batches.
 
         Args:
             input: Dict from prepare_sequences with "sequence_tokens" and
@@ -447,7 +409,13 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             inputs["structure_tokens"] = input["structure_tokens"].to(device)
         inputs = {k: v for k, v in inputs.items() if v is not None}
 
-        output = model(**inputs)
+        # ESM3 is often bfloat16; run forward under autocast to avoid Float/BFloat16 mismatch
+        with (
+            torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        ):
+            output = model(**inputs)
         embeddings = output.embeddings
         if embeddings.dtype == torch.bfloat16:
             embeddings = embeddings.float()
@@ -468,7 +436,7 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         self.pad_idx = self.model.tokenizer.pad_token_id
 
     def prepare_sequences(self, sequences, structures=None):
-        # check if model is wrapped in DataParallel
+        
         if isinstance(self.model, torch.nn.DataParallel):
             input_ids = self.model.module._tokenize(sequences)
         else:
@@ -480,24 +448,21 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     def forward(self, input):
         output: ESMCOutput = self.model(input)
 
-        # Yield embeddings to maintain compatibility with other models
+        
         for i in range(len(output.embeddings)):
-            x = output.embeddings[i]  # get embedding for sequence i
-            x = x[self.padding_mask[i]]  # remove padding tokens
-            yield x[1:-1]  # remove start and end tokens
+            x = output.embeddings[i]  
+            x = x[self.padding_mask[i]]  
+            yield x[1:-1]  
 
 
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
-    """
-    CARP model wrapper. Return a per-sequence embedding.
-    """
 
     embedding_kind = EmbeddingType.PER_PROTEIN
     structure_aware = False
 
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
-        # SimpleCollater for carp models
+        
         self.model, self.collater = load_model_and_alphabet(model_name)
         self.model.eval()
         self.repr_layer = repr_layer
@@ -506,19 +471,20 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
         logger.debug(f"Sequences: {sequences}")
         sequences = [
             [s] for s in sequences
-        ]  # convert to list of lists otherwise collater will fail
-        # returns (sequences,)
+        ]  
+        
         batch_tokens = self.collater(sequences)[0]
         logger.debug(f"batch: {batch_tokens}")
 
-        # Simply return a dictionary with the tokens
+        
         return {"tokens": batch_tokens}
 
     @torch.no_grad()
     def forward(self, input):
         logger.debug(f"Input: {input}")
         tokens = input["tokens"]
-        results = self.model(tokens, repr_layers=[self.repr_layer], logits=False)
+        results = self.model(tokens, repr_layers=[
+                             self.repr_layer], logits=False)
         token_representations = results["representations"][self.repr_layer]
         seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)
         logger.debug(f"Token representations: {token_representations}")
@@ -529,28 +495,23 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
 
 
 class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
-    """ProteinMPNN embedding model that requires structure information."""
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
 
     def __init__(self, model_name: str, ca_only: bool = False, use_structure: bool = True):
-        """
-        Initialize the ProteinMPNN embedding model.
-        
-        Args:
-            model_name: Path to the ProteinMPNN checkpoint file (.pt)
-            ca_only: Whether to use CA-only model (default: False)
-        """
         super().__init__()
-        print(f"Initializing ProteinMPNN embedding model with model name: {model_name}")
-        # get torch model cache location (local model cache)and prepend it to the model.
-        # TODO: add automatic download if model not found in cache.
+        print(
+            f"Initializing ProteinMPNN embedding model with model name: {model_name}")
+        
+        
         cache_dir = torch.hub.get_dir()
-        if os.path.exists(os.path.join(cache_dir,"ProteinMPNN", "weights", model_name)):
-            model_name = os.path.join(cache_dir,"ProteinMPNN", "weights", model_name)
+        if os.path.exists(os.path.join(cache_dir, "ProteinMPNN", "weights", model_name)):
+            model_name = os.path.join(
+                cache_dir, "ProteinMPNN", "weights", model_name)
         else:
-            # this_file_path/weights/model_name.pt
-            model_name = os.path.join(os.path.dirname(__file__), "weights", model_name)
+            
+            model_name = os.path.join(os.path.dirname(
+                __file__), "weights", model_name)
         print(f"Loading ProteinMPNN model from {model_name}")
         self.model = ProteinMPNN.from_pretrained(model_name, ca_only=ca_only)
         self.model.eval()
@@ -559,11 +520,11 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
     def prepare_sequences(self, sequences, structures=None):
         """
         Prepare sequences and structures for ProteinMPNN embedding.
-        
+
         Args:
             sequences: List of protein sequences
             structures: PDB file path (string) or list of PDB file paths (required)
-            
+
         Returns:
             Dictionary containing featurized inputs ready for forward pass
         """
@@ -574,57 +535,63 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
                 "Please provide structures parameter when using ProteinMPNN. "
                 "ProteinMPNN is a structure-conditioned model and cannot work with sequences alone."
             )
-        
+
         device = next(self.model.parameters()).device
-        pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
+
+        if isinstance(structures, str):
+            pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
+        else:
+            # List of PDB paths: use first for structure, batch from all if no sequences
+            pdb_dict_list = parse_PDB(structures[0], ca_only=self.ca_only) if structures else []
         logger.debug(f"pdb_dict_list: {len(pdb_dict_list)}")
         if not pdb_dict_list:
-            raise ValueError(f"Failed to parse PDB file: {structures}")
-        
+            raise ValueError(
+                f"Failed to parse PDB file: {structures if isinstance(structures, str) else structures[0] if structures else None}"
+            )
+
         pdb_dict = pdb_dict_list[0]
-        pdb_seq_len = len(pdb_dict.get('seq', ''))
-        
-        # Find all chain letters in the PDB dict
-        chain_keys = [key for key in pdb_dict.keys() if key.startswith('seq_chain_')]
-        chain_letters = [key.replace('seq_chain_', '') for key in chain_keys]
-        
-        # If sequences provided, check if all have same length as PDB
+        pdb_seq_len = len(pdb_dict.get("seq", ""))
+
+        chain_keys = [key for key in pdb_dict.keys() if key.startswith("seq_chain_")]
+        chain_letters = [key.replace("seq_chain_", "") for key in chain_keys]
+
         if sequences:
             if not all(len(seq) == pdb_seq_len for seq in sequences):
-                raise ValueError(f"All sequences ({len(sequences[0])}) must have the same length as PDB structure ({pdb_seq_len})")
-            # Create batch with same structure but different sequences
+                raise ValueError(
+                    f"All sequences ({len(sequences[0])}) must have the same length as PDB structure ({pdb_seq_len})"
+                )
             batch = []
             for seq in sequences:
                 seq_dict = pdb_dict.copy()
-                seq_dict['seq'] = seq
-                # Update all seq_chain_{letter} entries with the new sequence
-                # For multi-chain proteins, we need to split the sequence appropriately
-                # For now, assume single chain or concatenated sequence matches the PDB structure
+                seq_dict["seq"] = seq
                 if len(chain_letters) == 1:
-                    # Single chain: replace the entire chain sequence
-                    seq_dict[f'seq_chain_{chain_letters[0]}'] = seq
+                    seq_dict[f"seq_chain_{chain_letters[0]}"] = seq
                 else:
-                    # Multi-chain: need to split sequence by chain lengths
-                    # This is a simplified approach - assumes chains are concatenated in order
                     start_idx = 0
                     for letter in chain_letters:
-                        chain_key = f'seq_chain_{letter}'
+                        chain_key = f"seq_chain_{letter}"
                         if chain_key in pdb_dict:
                             chain_len = len(pdb_dict[chain_key])
-                            seq_dict[chain_key] = seq[start_idx:start_idx + chain_len]
+                            seq_dict[chain_key] = seq[start_idx : start_idx + chain_len]
                             start_idx += chain_len
                 batch.append(seq_dict)
+        elif not isinstance(structures, str) and structures:
+            batch = []
+            for pdb_path in structures:
+                pl = parse_PDB(pdb_path, ca_only=self.ca_only)
+                if not pl:
+                    raise ValueError(f"Failed to parse PDB file: {pdb_path}")
+                batch.append(pl[0])
         else:
             batch = [pdb_dict]
 
         
-        # Featurize using mpnn function
         featurized = tied_featurize(
             batch, device, chain_dict=None, fixed_position_dict=None,
             omit_AA_dict=None, tied_positions_dict=None, pssm_dict=None,
             bias_by_res_dict=None, ca_only=self.ca_only
         )
-        
+
         return {
             'X': featurized[0],
             'S': featurized[1],
@@ -646,7 +613,6 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         Yields:
             Embeddings for each sequence (per-residue)
         """
-        # Follow same logic for feature preparation as in ProteinMPNN in mpnn.py
         device = next(self.model.parameters()).device
         X = input['X'].to(device)
         S = input['S'].to(device)
@@ -655,13 +621,9 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         chain_encoding_all = input['chain_encoding_all'].to(device)
         lengths = input['lengths']
 
-        # --- Feature Preparation (matches ProteinMPNN) ---
-        # Get edge features and indices with ProteinFeatures
         E, E_idx = self.model.features(X, mask, residue_idx, chain_encoding_all)
-        
-        # Sequence and edge projections
         h_S = self.model.W_s(S)
-        h_V = h_S.clone()  # Initialize h_V with sequence embeddings
+        h_V = h_S.clone()
         h_E = self.model.W_e(E)
 
         # Masking for attention (gather_nodes is used both in mpnn.py and here)
@@ -672,10 +634,9 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         for layer in self.model.encoder_layers:
             h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
 
+
         for i, seq_len in enumerate(lengths):
             yield h_V[i, :seq_len].cpu()
-
-
 
 
 @dataclass
@@ -694,7 +655,7 @@ class ModelCard:
 
 
 model_descriptions = [
-    # CARP family (https://github.com/microsoft/protein-sequence-models)
+    
     ModelCard.from_model_cls(
         name="carp",
         family="CARP",
@@ -702,7 +663,7 @@ model_descriptions = [
         model_cls=CarpEmbeddingModel,
         model_kwargs=dict(model_name="carp_640M", repr_layer=56),
     ),
-    # ProtTrans family (https://github.com/agemagician/ProtTrans)
+    
     ModelCard.from_model_cls(
         name="prot_t5_xl_uniref50",
         family="ProtTrans",
@@ -745,7 +706,7 @@ model_descriptions = [
         model_cls=ProtBERTEmbeddingModel,
         model_kwargs=dict(model_name="prot_bert"),
     ),
-    # ESM family (https://github.com/facebookresearch/esm)
+    
     ModelCard.from_model_cls(
         name="esm2_t48",
         family="ESM",
@@ -788,7 +749,7 @@ model_descriptions = [
         model_cls=ESMEmbeddingModel,
         model_kwargs=dict(model_name="esm2_t6_8M_UR50D", repr_layer=6),
     ),
-    # https://github.com/evolutionaryscale/esm/tree/main
+    
     ModelCard.from_model_cls(
         name="esmc_600m",
         family="ESM",
@@ -810,7 +771,7 @@ model_descriptions = [
         model_cls=ESM3EmbeddingModel,
         model_kwargs=dict(model_name="esm3_sm_open_v1", use_norm_layer=True),
     ),
-    # ProteinMPNN
+    
     ModelCard.from_model_cls(
         name="mpnn",
         family="ProteinMPNN",
@@ -821,7 +782,8 @@ model_descriptions = [
 ]
 
 
-model_dict: dict[str, ModelCard] = OrderedDict((m.name, m) for m in model_descriptions)
+model_dict: dict[str, ModelCard] = OrderedDict(
+    (m.name, m) for m in model_descriptions)
 
 model_families = set(m.family for m in model_descriptions)
 

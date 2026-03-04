@@ -1,5 +1,4 @@
 ProtEnc: generate protein embeddings the easy way
-=======
 
 [ProtEnc](https://github.com/kklemon/ProtEnc) aims to simplify extraction of protein embeddings from various pre-trained models by providing simple APIs and bulk generation scripts for the ever-growing landscape of protein language models (pLMs). Currently, supported models are:
 
