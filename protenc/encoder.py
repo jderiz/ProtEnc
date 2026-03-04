@@ -208,13 +208,24 @@ class ProteinEncoder:
             else:
                 batch = batch.to(target_device)
 
-                # Handle model output (generators that yield embeddings)
             model_output = self._encode(batch)
 
-            for embed in model_output:
-                if average_sequence:
-                    embed = embed.mean(0)
-                yield utils.to_return_format(embed.cpu(), return_format)
+            try:
+                for embed in model_output:
+                    if average_sequence:
+                        embed = embed.mean(0)
+                    # Move to CPU and convert before yielding so consumer gets data
+                    # without holding GPU references; then release GPU tensor immediately.
+                    out = utils.to_return_format(embed.cpu(), return_format)
+                    del embed
+                    yield out
+            finally:
+                # Release batch and full model output so GPU memory is freed
+                # and does not accumulate across batches.
+                del model_output
+                del batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     def encode(
         self,

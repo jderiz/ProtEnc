@@ -180,7 +180,6 @@ class LMDBWriter(BaseOutputWriter):
 
         _, txn = self.ctx
         try:
-            # TODO: should probably be JSON and not pickled
             txn.put(label.encode(), pickle.dumps(embedding))
             self.counter += 1
 
