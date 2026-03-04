@@ -342,11 +342,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                     # Use default ESM3 tokenization for sequence and structure
                     protein_tensors = [model.encode(p) for p in proteins]
             except Exception as e:
-                logger.warning(f"Failed to load structure from {structure_path}: {e}")
-                proteins = [ESMProtein(sequence=seq) for seq in sequences]
-                model = self._get_model()
-                protein_tensors = [model.encode(p) for p in proteins]
-                use_structure = False
+                raise ValueError(f"Failed to prepare sequences for ESM3: {e}")
 
         # Collate like haipr prepare_training_features: sequence_tokens_list, structure_tokens_list
         sequence_tokens_list = []
