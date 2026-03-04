@@ -520,11 +520,11 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
     def prepare_sequences(self, sequences, structures=None):
         """
         Prepare sequences and structures for ProteinMPNN embedding.
-        
+
         Args:
             sequences: List of protein sequences
             structures: PDB file path (string) or list of PDB file paths (required)
-            
+
         Returns:
             Dictionary containing featurized inputs ready for forward pass
         """
@@ -537,49 +537,55 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
             )
 
         device = next(self.model.parameters()).device
-        pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
+
+        if isinstance(structures, str):
+            pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
+        else:
+            # List of PDB paths: use first for structure, batch from all if no sequences
+            pdb_dict_list = parse_PDB(structures[0], ca_only=self.ca_only) if structures else []
         logger.debug(f"pdb_dict_list: {len(pdb_dict_list)}")
         if not pdb_dict_list:
-            raise ValueError(f"Failed to parse PDB file: {structures}")
-        
+            raise ValueError(
+                f"Failed to parse PDB file: {structures if isinstance(structures, str) else structures[0] if structures else None}"
+            )
+
         pdb_dict = pdb_dict_list[0]
-        pdb_seq_len = len(pdb_dict.get('seq', ''))
-        
-        # Find all chain letters in the PDB dict
-        chain_keys = [key for key in pdb_dict.keys() if key.startswith('seq_chain_')]
-        chain_letters = [key.replace('seq_chain_', '') for key in chain_keys]
-        
-        # If sequences provided, check if all have same length as PDB
+        pdb_seq_len = len(pdb_dict.get("seq", ""))
+
+        chain_keys = [key for key in pdb_dict.keys() if key.startswith("seq_chain_")]
+        chain_letters = [key.replace("seq_chain_", "") for key in chain_keys]
+
         if sequences:
             if not all(len(seq) == pdb_seq_len for seq in sequences):
-                raise ValueError(f"All sequences ({len(sequences[0])}) must have the same length as PDB structure ({pdb_seq_len})")
-            # Create batch with same structure but different sequences
+                raise ValueError(
+                    f"All sequences ({len(sequences[0])}) must have the same length as PDB structure ({pdb_seq_len})"
+                )
             batch = []
             for seq in sequences:
                 seq_dict = pdb_dict.copy()
-                seq_dict['seq'] = seq
-                # Update all seq_chain_{letter} entries with the new sequence
-                # For multi-chain proteins, we need to split the sequence appropriately
-                # For now, assume single chain or concatenated sequence matches the PDB structure
+                seq_dict["seq"] = seq
                 if len(chain_letters) == 1:
-                    # Single chain: replace the entire chain sequence
-                    seq_dict[f'seq_chain_{chain_letters[0]}'] = seq
+                    seq_dict[f"seq_chain_{chain_letters[0]}"] = seq
                 else:
-                    # Multi-chain: need to split sequence by chain lengths
-                    # This is a simplified approach - assumes chains are concatenated in order
                     start_idx = 0
                     for letter in chain_letters:
-                        chain_key = f'seq_chain_{letter}'
+                        chain_key = f"seq_chain_{letter}"
                         if chain_key in pdb_dict:
                             chain_len = len(pdb_dict[chain_key])
-                            seq_dict[chain_key] = seq[start_idx:start_idx + chain_len]
+                            seq_dict[chain_key] = seq[start_idx : start_idx + chain_len]
                             start_idx += chain_len
                 batch.append(seq_dict)
+        elif not isinstance(structures, str) and structures:
+            batch = []
+            for pdb_path in structures:
+                pl = parse_PDB(pdb_path, ca_only=self.ca_only)
+                if not pl:
+                    raise ValueError(f"Failed to parse PDB file: {pdb_path}")
+                batch.append(pl[0])
         else:
             batch = [pdb_dict]
 
         
-        # Featurize using mpnn function
         featurized = tied_featurize(
             batch, device, chain_dict=None, fixed_position_dict=None,
             omit_AA_dict=None, tied_positions_dict=None, pssm_dict=None,
@@ -607,7 +613,6 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         Yields:
             Embeddings for each sequence (per-residue)
         """
-        # Follow same logic for feature preparation as in ProteinMPNN in mpnn.py
         device = next(self.model.parameters()).device
         X = input['X'].to(device)
         S = input['S'].to(device)
@@ -616,13 +621,9 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         chain_encoding_all = input['chain_encoding_all'].to(device)
         lengths = input['lengths']
 
-        # --- Feature Preparation (matches ProteinMPNN) ---
-        # Get edge features and indices with ProteinFeatures
         E, E_idx = self.model.features(X, mask, residue_idx, chain_encoding_all)
-        
-        # Sequence and edge projections
         h_S = self.model.W_s(S)
-        h_V = h_S.clone()  # Initialize h_V with sequence embeddings
+        h_V = h_S.clone()
         h_E = self.model.W_e(E)
 
         # Masking for attention (gather_nodes is used both in mpnn.py and here)
