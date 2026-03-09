@@ -422,21 +422,20 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         self.pad_idx = self.model.tokenizer.pad_token_id
 
     def prepare_sequences(self, sequences, structures=None):
-
         if isinstance(self.model, torch.nn.DataParallel):
             input_ids = self.model.module._tokenize(sequences)
         else:
             input_ids = self.model._tokenize(sequences)
-        self.padding_mask = input_ids != self.pad_idx
         return input_ids
 
     @torch.no_grad()
     def forward(self, input):
+        padding_mask = input != self.pad_idx
         output: ESMCOutput = self.model(input)
 
         for i in range(len(output.embeddings)):
             x = output.embeddings[i]
-            x = x[self.padding_mask[i]]
+            x = x[padding_mask[i]]
             yield x[1:-1]
 
 
