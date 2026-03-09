@@ -199,40 +199,9 @@ class ProteinEncoder:
         Yields (index, embed) so the consumer can write to disk by index (streamed).
         """
         target_device = self._get_primary_device()
-
-        if self._same_length_batch:
-            # Phase 1: prepare_sequences for all sequences; Phase 2: forward in batches
-            yield from self._encode_two_phase(
-                proteins, structures, average_sequence, return_format, target_device
-            )
-            return
-
-        # Phase 1 + 2 per batch: prepare_sequences then forward; two progress bars
-        n = len(proteins)
-        pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
-        pbar_embed = tqdm(total=n, desc="Embedding", unit="seq")
-        try:
-            for batch_indices, batch_sequences in self._iter_batches(proteins):
-                batch = self.prepare_sequences(batch_sequences, structures)
-                pbar_prepare.update(len(batch_indices))
-                batch = self._batch_to_device(batch, target_device)
-                model_output = self._encode(batch)
-                try:
-                    for i, embed in enumerate(model_output):
-                        if average_sequence:
-                            embed = embed.mean(0)
-                        out = utils.to_return_format(embed.cpu(), return_format)
-                        del embed
-                        yield (batch_indices[i], out)
-                        pbar_embed.update(1)
-                finally:
-                    del model_output
-                    del batch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-        finally:
-            pbar_prepare.close()
-            pbar_embed.close()
+        yield from self._encode_two_phase(
+            proteins, structures, average_sequence, return_format, target_device
+        )
 
     def _batch_to_device(self, batch, target_device: torch.device):
         """Move batch tensors to device (dict, list, or single tensor)."""
@@ -253,64 +222,41 @@ class ProteinEncoder:
         return_format: ReturnFormat,
         target_device: torch.device,
     ):
-        """Phase 1: prepare_sequences for all sequences. Phase 2: forward in batches. Yields (index, embed)."""
-        from collections import defaultdict
-
-        by_len = defaultdict(list)
-        for i, p in enumerate(proteins):
-            by_len[len(p)].append(i)
-
+        """
+        Phase 1: prepare_sequences for all sequences (batched via _iter_batches).
+        Phase 2: batch-wise forward. Yields (index, embed).
+        Same flow for all models (ESM3, ESMC, etc.).
+        """
         n = len(proteins)
+        stored_batches = []
+
         pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
-        # Phase 1: prepare_sequences for all (chunked by length group)
-        tokenized_by_idx = {}
         try:
-            for _length in sorted(by_len.keys()):
-                indices_L = by_len[_length]
-                for start in range(0, len(indices_L), self.batch_size):
-                    chunk_indices = indices_L[start : start + self.batch_size]
-                    chunk_sequences = [proteins[j] for j in chunk_indices]
-                    batch_dict = self.prepare_sequences(chunk_sequences, structures)
-                    pbar_prepare.update(len(chunk_indices))
-                    for k, idx in enumerate(chunk_indices):
-                        seq_t = batch_dict["sequence_tokens"][k]
-                        struct_t = (
-                            batch_dict["structure_tokens"][k]
-                            if "structure_tokens" in batch_dict
-                            and batch_dict["structure_tokens"] is not None
-                            else None
-                        )
-                        tokenized_by_idx[idx] = (seq_t, struct_t)
+            for batch_indices, batch_sequences in self._iter_batches(proteins):
+                prepared_batch = self.prepare_sequences(batch_sequences, structures)
+                stored_batches.append((batch_indices, prepared_batch))
+                pbar_prepare.update(len(batch_indices))
         finally:
             pbar_prepare.close()
 
         pbar_embed = tqdm(total=n, desc="Embedding", unit="seq")
-        # Phase 2: forward in batches, yield (index, embed)
         try:
-            for _length in sorted(by_len.keys()):
-                indices_L = by_len[_length]
-                for start in range(0, len(indices_L), self.batch_size):
-                    batch_indices = indices_L[start : start + self.batch_size]
-                    seq_list = [tokenized_by_idx[i][0] for i in batch_indices]
-                    struct_list = [tokenized_by_idx[i][1] for i in batch_indices]
-                    batch = {"sequence_tokens": torch.stack(seq_list)}
-                    if struct_list[0] is not None:
-                        batch["structure_tokens"] = torch.stack(struct_list)
-                    batch = self._batch_to_device(batch, target_device)
-                    model_output = self._encode(batch)
-                    try:
-                        for i, embed in enumerate(model_output):
-                            if average_sequence:
-                                embed = embed.mean(0)
-                            out = utils.to_return_format(embed.cpu(), return_format)
-                            del embed
-                            yield (batch_indices[i], out)
-                            pbar_embed.update(1)
-                    finally:
-                        del model_output
-                        del batch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+            for batch_indices, prepared_batch in stored_batches:
+                batch = self._batch_to_device(prepared_batch, target_device)
+                model_output = self._encode(batch)
+                try:
+                    for i, embed in enumerate(model_output):
+                        if average_sequence:
+                            embed = embed.mean(0)
+                        out = utils.to_return_format(embed.cpu(), return_format)
+                        del embed
+                        yield (batch_indices[i], out)
+                        pbar_embed.update(1)
+                finally:
+                    del model_output
+                    del batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         finally:
             pbar_embed.close()
 
