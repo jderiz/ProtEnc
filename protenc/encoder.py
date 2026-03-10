@@ -160,23 +160,30 @@ class ProteinEncoder:
                 chunk = list(range(start, min(start + self.batch_size, n)))
                 yield chunk, [proteins[j] for j in chunk]
 
-    def prepare_sequences(self, proteins: list[str], structures=None):
+    def prepare_sequences(
+        self,
+        proteins: list[str],
+        structures=None,
+        chain_list=None,
+        structure_id=None,
+    ):
         """Prepare protein sequences for encoding, optionally with structures."""
-        # Always pass structures to models - they can decide whether to use them
         import inspect
         try:
             sig = inspect.signature(self.model.prepare_sequences)
-            
-            # Check which parameter name the model uses
-            if 'structures' in sig.parameters:
-                return self.model.prepare_sequences(proteins, structures=structures)
-            elif 'structure_path' in sig.parameters:
-                return self.model.prepare_sequences(proteins, structure_path=structures)
-            else:
-                # Models that don't accept structures parameter (shouldn't happen with base class)
-                return self.model.prepare_sequences(proteins)
+            kwargs = {}
+            if "structures" in sig.parameters:
+                kwargs["structures"] = structures
+            elif "structure_path" in sig.parameters:
+                kwargs["structure_path"] = structures
+            if chain_list is not None and "chain_list" in sig.parameters:
+                kwargs["chain_list"] = chain_list
+            if structure_id is not None and "structure_id" in sig.parameters:
+                kwargs["structure_id"] = structure_id
+            if kwargs:
+                return self.model.prepare_sequences(proteins, **kwargs)
+            return self.model.prepare_sequences(proteins)
         except (AttributeError, TypeError):
-            # Fallback if signature inspection fails
             return self.model.prepare_sequences(proteins, structures=structures)
 
     def _encode(self, batch):
@@ -193,6 +200,8 @@ class ProteinEncoder:
         structures=None,
         average_sequence: bool = False,
         return_format: ReturnFormat = "torch",
+        chain_list=None,
+        structure_id=None,
     ):
         """
         Flow for all models: 1) prepare_sequences (tokenization), 2) batch-wise forward.
@@ -200,7 +209,13 @@ class ProteinEncoder:
         """
         target_device = self._get_primary_device()
         yield from self._encode_two_phase(
-            proteins, structures, average_sequence, return_format, target_device
+            proteins,
+            structures,
+            average_sequence,
+            return_format,
+            target_device,
+            chain_list=chain_list,
+            structure_id=structure_id,
         )
 
     def _batch_to_device(self, batch, target_device: torch.device):
@@ -221,6 +236,8 @@ class ProteinEncoder:
         average_sequence: bool,
         return_format: ReturnFormat,
         target_device: torch.device,
+        chain_list=None,
+        structure_id=None,
     ):
         """
         Phase 1: prepare_sequences for all sequences (batched via _iter_batches).
@@ -233,7 +250,12 @@ class ProteinEncoder:
         pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
         try:
             for batch_indices, batch_sequences in self._iter_batches(proteins):
-                prepared_batch = self.prepare_sequences(batch_sequences, structures)
+                prepared_batch = self.prepare_sequences(
+                    batch_sequences,
+                    structures,
+                    chain_list=chain_list,
+                    structure_id=structure_id,
+                )
                 stored_batches.append((batch_indices, prepared_batch))
                 pbar_prepare.update(len(batch_indices))
         finally:
@@ -266,6 +288,8 @@ class ProteinEncoder:
         structures=None,
         average_sequence: bool = True,  # mean over residue dimension
         return_format: ReturnFormat = "torch",
+        chain_list=None,
+        structure_id=None,
     ):
         """
         Encode proteins into embeddings.
@@ -275,6 +299,8 @@ class ProteinEncoder:
             structures: Optional path(s) to structure file(s) for structure-aware models
             average_sequence: Whether to average over the sequence dimension
             return_format: Format for the embeddings ("torch", "numpy", etc.)
+            chain_list: Optional list of chain IDs in order (for structure-aware models)
+            structure_id: Optional structure id for ESM loading by chain_list
 
         Yields:
             Embeddings for each protein in the requested format
@@ -287,6 +313,8 @@ class ProteinEncoder:
                 structures=structures,
                 average_sequence=average_sequence,
                 return_format=return_format,
+                chain_list=chain_list,
+                structure_id=structure_id,
             )
             for _idx, emb in gen:
                 yield keys[_idx], emb
@@ -296,6 +324,8 @@ class ProteinEncoder:
                 structures=structures,
                 average_sequence=average_sequence,
                 return_format=return_format,
+                chain_list=chain_list,
+                structure_id=structure_id,
             )
             for item in gen:
                 yield item  # (index, embed) for streamed write-by-index
