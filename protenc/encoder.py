@@ -345,6 +345,13 @@ class ProteinEncoder:
         """
         Encode a batch of proteins at once.
 
+        When invoked from HAIPR, ``proteins`` should be a list of
+        sequences in HAIPR embedding format (see
+        ``haipr.data.HAIPRData.get_sequences_for_embedding``), and, when
+        ``structures`` is provided, each sequence length is expected to
+        match the residue count of the corresponding structure for the
+        loaded chains.
+
         Args:
             proteins: List of protein sequences
             structures: Optional path(s) to structure file(s) for structure-aware models
