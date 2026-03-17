@@ -284,62 +284,66 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                 protein_with_structure = ESMProtein.from_protein_complex(pc)
                 shared_coordinates = protein_with_structure.coordinates
 
-                # Align sequences to loaded chains (mirrors haipr chain_map logic)
-                aligned_sequences = []
-                try:
-                    from biotite.structure.io.pdb import PDBFile
+                if chain_list is not None:
+                    # Fast path: HAIPRData guarantees sequences are already in chain_list
+                    # order (split on "|"). Strip "|" to produce a flat sequence whose
+                    # residue count matches shared_coordinates exactly.
+                    flat_sequences = [seq.replace("|", "") for seq in sequences]
+                else:
+                    # Slow path: align sequences to PDB chain order via biotite.
+                    flat_sequences = []
+                    try:
+                        from biotite.structure.io.pdb import PDBFile as _PDBFile
 
-                    pdb_file = PDBFile.read(structure_path)
-                    structure = pdb_file.get_structure()
-                    models = (
-                        structure[0]
-                        if hasattr(structure, "stack_depth") and structure.stack_depth() > 0
-                        else structure
-                    )
-                    all_chain_ids = []
-                    for cid in models.chain_id:
-                        if cid not in all_chain_ids:
-                            all_chain_ids.append(cid)
-                    loaded_chain_ids = [c.chain_id for c in pc.chain_iter()]
-                    logger.debug(
-                        f"PDB chains: {all_chain_ids}, ProteinComplex loaded chains: {loaded_chain_ids}"
-                    )
-                    for seq in sequences:
-                        parts = seq.split("|")
-                        if len(parts) == len(all_chain_ids):
-                            chain_to_seq = dict(zip(all_chain_ids, parts))
-                            aligned_parts = []
-                            for chain in pc.chain_iter():
-                                cid = chain.chain_id
-                                seq_part = chain_to_seq.get(cid, "")
-                                aligned_parts.append(
-                                    seq_part if seq_part else str(
-                                        chain.sequence)
+                        pdb_file = _PDBFile.read(structure_path)
+                        structure = pdb_file.get_structure()
+                        models = (
+                            structure[0]
+                            if hasattr(structure, "stack_depth") and structure.stack_depth() > 0
+                            else structure
+                        )
+                        all_chain_ids = []
+                        for cid in models.chain_id:
+                            if cid not in all_chain_ids:
+                                all_chain_ids.append(cid)
+                        loaded_chain_ids = [c.chain_id for c in pc.chain_iter()]
+                        logger.debug(
+                            f"PDB chains: {all_chain_ids}, ProteinComplex loaded chains: {loaded_chain_ids}"
+                        )
+                        for seq in sequences:
+                            parts = seq.split("|")
+                            if len(parts) == len(all_chain_ids):
+                                chain_to_seq = dict(zip(all_chain_ids, parts))
+                                aligned_parts = [
+                                    chain_to_seq.get(c.chain_id, "") or str(c.sequence)
+                                    for c in pc.chain_iter()
+                                ]
+                                flat_sequences.append("".join(aligned_parts))
+                            elif len(parts) == len(loaded_chain_ids):
+                                flat_sequences.append(seq.replace("|", ""))
+                            else:
+                                logger.warning(
+                                    f"Sequence parts ({len(parts)}) don't match PDB chains "
+                                    f"({len(all_chain_ids)}) or loaded chains ({len(loaded_chain_ids)}). "
+                                    "Falling back to stripping chain-break tokens."
                                 )
-                            aligned_sequences.append("|".join(aligned_parts))
-                        elif len(parts) == len(loaded_chain_ids):
-                            aligned_sequences.append(seq)
-                        else:
-                            logger.warning(
-                                f"Sequence parts ({len(parts)}) don't match PDB chains "
-                                f"({len(all_chain_ids)}) or loaded chains ({len(loaded_chain_ids)})."
-                            )
-                            aligned_sequences.append(seq)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to align sequences using biotite: {e}")
-                    aligned_sequences = sequences
+                                flat_sequences.append(seq.replace("|", ""))
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to align sequences using biotite: {e}; "
+                            "falling back to stripping chain-break tokens."
+                        )
+                        flat_sequences = [seq.replace("|", "") for seq in sequences]
 
                 proteins = [
-                    ESMProtein(sequence=seq, coordinates=shared_coordinates)
-                    for seq in aligned_sequences
+                    ESMProtein(sequence=flat_seq, coordinates=shared_coordinates)
+                    for flat_seq in flat_sequences
                 ]
                 first = proteins[0]
                 if first.coordinates is None:
                     protein_tensors = [model.encode(p) for p in proteins]
                     use_structure = False
                 else:
-                    # Use default ESM3 tokenization for sequence and structure
                     protein_tensors = [model.encode(p) for p in proteins]
             except Exception as e:
                 raise ValueError(f"Failed to prepare sequences for ESM3: {e}")
