@@ -41,6 +41,8 @@ class EmbeddingType(Enum):
 
 class BaseProteinEmbeddingModel(nn.Module):
     embedding_type: EmbeddingType
+    # Default: no explicit chain break token. Specific models may override.
+    chain_break_token: str = ""
 
     def prepare_sequences(self, sequences, structures=None):
         return NotImplementedError
@@ -149,6 +151,8 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
 class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = False
+    # ESM2-style models in HAIPR use "<eos>" as chain break token.
+    chain_break_token: str = "<eos>"
 
     def __init__(self, model_name: str, repr_layer: int):
         super().__init__()
@@ -221,6 +225,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
     requires_same_length_batch = True
+    # ProtEnc ESM3 expects "|" as the multi-chain separator.
+    chain_break_token: str = "|"
 
     def __init__(self, model_name: str, use_norm_layer: bool = True):
         super().__init__()
@@ -418,6 +424,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = False
+    # ESMC uses "|" as the multi-chain separator when applicable.
+    chain_break_token: str = "|"
 
     def __init__(self, model_name: str):
         super().__init__()

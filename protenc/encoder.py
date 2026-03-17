@@ -141,6 +141,19 @@ class ProteinEncoder:
 
         return issues
 
+    @property
+    def chain_break_token(self) -> str:
+        """
+        Chain break token expected by the underlying embedding model.
+
+        Defaults to empty string when the model does not define one.
+        """
+        model = self.model
+        # When DataParallel is applied, the wrapped module may live under .module
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        return getattr(model, "chain_break_token", "")
+
     def _iter_batches(self, proteins: list[str]):
         """Iterate (batch_indices, batch_sequences). Same-length models: group by length then chunk; else consecutive chunks."""
         assert isinstance(self.batch_size, int), "batch size must be an integer"
