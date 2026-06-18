@@ -25,6 +25,7 @@ class ProteinEncoder:
         preprocess_workers: int = 0,
         dataloader: DataLoader = DataLoader,
         data_parallel: bool = False,
+        device_ids: list[int] | None = None,
     ):
         """
         Initialize the protein encoder.
@@ -36,6 +37,7 @@ class ProteinEncoder:
             preprocess_workers: Number of workers for data preprocessing
             dataloader: DataLoader class to use
             data_parallel: Whether to use data parallel across all available GPUs
+            device_ids: Optional explicit GPU ids for DataParallel (default: all visible GPUs)
         """
         self.model = model
         self.batch_size = 1 if batch_size is None else batch_size
@@ -44,6 +46,7 @@ class ProteinEncoder:
         self.preprocess_workers = preprocess_workers
         self.dataloader = dataloader
         self.data_parallel = data_parallel
+        self.device_ids = device_ids
 
         # Apply data parallel if requested and CUDA is available
         if self.data_parallel and torch.cuda.is_available():
@@ -70,12 +73,20 @@ class ProteinEncoder:
             else:
                 # Apply DataParallel for other models
                 try:
+                    parallel_device_ids = self.device_ids
+                    if parallel_device_ids is None and torch.cuda.is_available():
+                        parallel_device_ids = list(range(torch.cuda.device_count()))
+
                     if hasattr(self.model, "model"):
                         # Some models wrap the actual model in a .model attribute
-                        self.model.model = nn.DataParallel(self.model.model)
+                        self.model.model = nn.DataParallel(
+                            self.model.model, device_ids=parallel_device_ids
+                        )
                     else:
                         # Direct model wrapping
-                        self.model = nn.DataParallel(self.model)
+                        self.model = nn.DataParallel(
+                            self.model, device_ids=parallel_device_ids
+                        )
                 except Exception as e:
                     import warnings
 
@@ -119,8 +130,15 @@ class ProteinEncoder:
         if not self.is_data_parallel:
             return {"enabled": False, "device_count": 1, "devices": [str(self.device)]}
 
-        device_count = torch.cuda.device_count()
-        devices = [f"cuda:{i}" for i in range(device_count)]
+        device_count = (
+            len(self.device_ids)
+            if self.device_ids is not None
+            else torch.cuda.device_count()
+        )
+        if self.device_ids is not None:
+            devices = [f"cuda:{i}" for i in self.device_ids]
+        else:
+            devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
 
         return {
             "enabled": True,
@@ -410,7 +428,7 @@ class ProteinEncoder:
         return self.encode(*args, **kwargs)
 
 
-def get_encoder(model_name, device=None, data_parallel=False, **kwargs):
+def get_encoder(model_name, device=None, data_parallel=False, device_ids=None, **kwargs):
     """
     Create a ProteinEncoder instance with the specified model.
 
@@ -418,6 +436,7 @@ def get_encoder(model_name, device=None, data_parallel=False, **kwargs):
         model_name: Name of the model to load
         device: Device to place the model on
         data_parallel: Whether to use data parallel across all available GPUs
+        device_ids: Optional explicit GPU ids for DataParallel
         **kwargs: Additional arguments to pass to ProteinEncoder
 
     Returns:
@@ -445,4 +464,6 @@ def get_encoder(model_name, device=None, data_parallel=False, **kwargs):
             except Exception as e:
                 raise ValueError(f"Invalid device specification '{device}': {e}")
 
-    return ProteinEncoder(model, data_parallel=data_parallel, **kwargs)
+    return ProteinEncoder(
+        model, data_parallel=data_parallel, device_ids=device_ids, **kwargs
+    )

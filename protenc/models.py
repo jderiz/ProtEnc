@@ -389,7 +389,6 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
         Uses model(**inputs) then output.embeddings. Yields per-sequence embeddings
         (BOS/EOS stripped). Supports sequence-only or sequence+structure batches.
-
         Args:
             input: Dict from prepare_sequences with "sequence_tokens" and
                 optional "structure_tokens" (same-length batch, no padding).
