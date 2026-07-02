@@ -7,7 +7,7 @@ from tqdm import tqdm
 from protenc.types import BatchSize, ProteinEncoderInput, ReturnFormat
 from torch.utils.data import DataLoader
 from protenc.models import BaseProteinEmbeddingModel, get_model
-from esm.models.esmc import ESMC
+from haipr.models.esmc_loading import is_esmc_hf_model
 
 
 class ProteinEncoder:
@@ -53,13 +53,13 @@ class ProteinEncoder:
             # Check if this is an ESMC model - DataParallel doesn't work well with ESMC
             is_esmc_model = False
             if hasattr(self.model, "model"):
-                if hasattr(self.model.model, "model") and isinstance(
-                    self.model.model.model, ESMC
+                if hasattr(self.model.model, "model") and is_esmc_hf_model(
+                    self.model.model.model
                 ):
                     is_esmc_model = True
-                elif isinstance(self.model.model, ESMC):
+                elif is_esmc_hf_model(self.model.model):
                     is_esmc_model = True
-            elif hasattr(self.model, "model") and isinstance(self.model.model, ESMC):
+            elif hasattr(self.model, "model") and is_esmc_hf_model(self.model.model):
                 is_esmc_model = True
 
             if is_esmc_model:

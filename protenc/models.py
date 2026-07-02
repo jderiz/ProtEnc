@@ -17,7 +17,12 @@ from transformers import (
 from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
 import re
-from esm.models.esmc import ESMC, ESMCOutput
+from haipr.models.esmc_loading import (
+    esmc_last_hidden_state,
+    is_esmc_hf_model,
+    load_esmc,
+    tokenize_esmc_sequences,
+)
 from esm.models.esm3 import ESM3
 from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
 from esm.utils.structure.protein_chain import ProteinChain
@@ -423,31 +428,27 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = False
-    # ESMC uses "|" as the multi-chain separator when applicable.
     chain_break_token: str = "|"
 
     def __init__(self, model_name: str):
         super().__init__()
-        self.model: ESMC = ESMC.from_pretrained(model_name)
-        self.model.eval()
-        self.pad_idx = self.model.tokenizer.pad_token_id
+        self.model, self.tokenizer = load_esmc(model_name)
+        self.pad_idx = self.tokenizer.pad_token_id
 
     def prepare_sequences(self, sequences, structures=None):
-        if isinstance(self.model, torch.nn.DataParallel):
-            input_ids = self.model.module._tokenize(sequences)
-        else:
-            input_ids = self.model._tokenize(sequences)
-        return input_ids
+        return tokenize_esmc_sequences(self.tokenizer, sequences)
 
     @torch.no_grad()
     def forward(self, input):
-        padding_mask = input != self.pad_idx
-        output: ESMCOutput = self.model(input)
+        inputs = dict(input) if hasattr(input, "keys") else {"input_ids": input}
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = inputs["input_ids"] != self.pad_idx
+        embeddings = esmc_last_hidden_state(self.model, inputs)
 
-        for i in range(len(output.embeddings)):
-            x = output.embeddings[i]
-            x = x[padding_mask[i]]
-            yield x[1:-1]
+        for i in range(embeddings.shape[0]):
+            x = embeddings[i][attention_mask[i].bool()]
+            yield x[1:-1].cpu()
 
 
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
@@ -750,6 +751,13 @@ model_descriptions = [
         embed_dim=1152,
         model_cls=ESMCEmbeddingModel,
         model_kwargs=dict(model_name="esmc_600m"),
+    ),
+    ModelCard.from_model_cls(
+        name="esmc_6b",
+        family="ESM",
+        embed_dim=2560,
+        model_cls=ESMCEmbeddingModel,
+        model_kwargs=dict(model_name="esmc_6b"),
     ),
     ModelCard.from_model_cls(
         name="esmc_300m",
