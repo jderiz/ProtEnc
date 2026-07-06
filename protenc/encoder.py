@@ -172,6 +172,14 @@ class ProteinEncoder:
             model = model.module
         return getattr(model, "chain_break_token", "")
 
+    @property
+    def repr_layer(self) -> int | None:
+        """Representation layer used by the underlying embedding model."""
+        model = self.model
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        return getattr(model, "repr_layer", None)
+
     def _iter_batches(self, proteins: list[str]):
         """Iterate (batch_indices, batch_sequences). Same-length models: group by length then chunk; else consecutive chunks."""
         assert isinstance(self.batch_size, int), "batch size must be an integer"
@@ -428,13 +436,21 @@ class ProteinEncoder:
         return self.encode(*args, **kwargs)
 
 
-def get_encoder(model_name, device=None, data_parallel=False, device_ids=None, **kwargs):
+def get_encoder(
+    model_name,
+    device=None,
+    repr_layer=None,
+    data_parallel=False,
+    device_ids=None,
+    **kwargs,
+):
     """
     Create a ProteinEncoder instance with the specified model.
 
     Args:
         model_name: Name of the model to load
         device: Device to place the model on
+        repr_layer: Optional 1-indexed transformer layer for representations
         data_parallel: Whether to use data parallel across all available GPUs
         device_ids: Optional explicit GPU ids for DataParallel
         **kwargs: Additional arguments to pass to ProteinEncoder
@@ -442,7 +458,7 @@ def get_encoder(model_name, device=None, data_parallel=False, device_ids=None, *
     Returns:
         ProteinEncoder instance
     """
-    model = get_model(model_name)
+    model = get_model(model_name, repr_layer=repr_layer)
 
     # Validate and handle device parameter
     if device is not None:

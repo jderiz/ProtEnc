@@ -66,7 +66,7 @@ def collate_fn(samples, max_len=None, transform_fn=None):
 
 @torch.no_grad()
 def main(args):
-    model = protenc.get_model(args.model_name)
+    model = protenc.get_model(args.model_name, repr_layer=args.repr_layer)
     model.eval()
 
     logger.info(f"Reading data from {args.input_path}")
@@ -193,6 +193,12 @@ def entrypoint():
         default="prot_bert",
         choices=protenc.list_models(),
         help="Name / ID of the embedding model to be loaded.",
+    )
+    parser.add_argument(
+        "--repr_layer",
+        type=int,
+        default=None,
+        help="1-indexed transformer layer for representations (default: model's final layer).",
     )
     parser.add_argument(
         "--data_parallel",

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import contextlib
 import os
+import warnings
 import torch
 import torch.nn as nn
 from collections import OrderedDict
@@ -18,16 +19,15 @@ from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
 import re
 from haipr.models.esmc_loading import (
-    esmc_last_hidden_state,
-    is_esmc_hf_model,
+    ESMC_HF_REPOS,
+    esmc_hidden_at_layer,
+    hf_config_num_layers,
     load_esmc,
     tokenize_esmc_sequences,
 )
 from esm.models.esm3 import ESM3
-from esm.sdk.api import ESMProtein, ESMProteinTensor, ProteinComplex
+from esm.sdk.api import ESMProtein, ProteinComplex
 from esm.utils.structure.protein_chain import ProteinChain
-from esm.utils.sampling import _BatchedESMProteinTensor
-from esm.utils.generation import _batch_forward
 
 try:
     from .mpnn import ProteinMPNN, parse_PDB, tied_featurize, gather_nodes
@@ -37,6 +37,79 @@ except ImportError:
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.ERROR)
+
+_ESMC_NUM_LAYERS = {
+    "esmc_300m": 30,
+    "esmc_600m": 36,
+    "esmc_6b": 80,
+}
+for _alias, _repo in ESMC_HF_REPOS.items():
+    _ESMC_NUM_LAYERS[_repo.lower()] = _ESMC_NUM_LAYERS[_alias]
+
+
+def resolve_repr_layer(repr_layer: int | None, num_layers: int) -> int:
+    return num_layers if repr_layer is None else repr_layer
+
+
+def validate_repr_layer(repr_layer: int, num_layers: int, *, model_name: str) -> None:
+    if not 1 <= repr_layer <= num_layers:
+        warnings.warn(
+            f"repr_layer={repr_layer} is invalid for '{model_name}': "
+            f"valid range is 1..{num_layers}.",
+            stacklevel=2,
+        )
+        raise ValueError(
+            f"repr_layer={repr_layer} is invalid for '{model_name}': "
+            f"valid range is 1..{num_layers}."
+        )
+
+
+def _esm2_num_layers_from_name(name: str) -> int:
+    match = re.search(r"esm2_t(\d+)", name, re.IGNORECASE)
+    if not match:
+        raise ValueError(
+            f"Cannot determine ESM2 layer count from name '{name}'. "
+            "Expected pattern esm2_t<N>_..."
+        )
+    return int(match.group(1))
+
+
+def _esmc_num_layers_from_name(name: str) -> int:
+    lowered = name.lower()
+    for variant, num_layers in _ESMC_NUM_LAYERS.items():
+        if variant in lowered:
+            return num_layers
+    warnings.warn(f"Unknown ESMC variant in name '{name}'.")
+    raise ValueError(
+        f"Unknown ESMC variant in name '{name}'. "
+        f"Expected one of {sorted(_ESMC_NUM_LAYERS)}."
+    )
+
+def _hf_hidden_at_layer(hidden_states: tuple, repr_layer: int) -> torch.Tensor:
+    return hidden_states[repr_layer]
+
+
+def _esm3_hidden_at_layer(hidden_states: tuple, repr_layer: int) -> torch.Tensor:
+    return hidden_states[repr_layer - 1]
+
+
+def _assert_hf_num_hidden_layers(
+    model: nn.Module, expected: int, *, model_name: str
+) -> None:
+    actual = hf_config_num_layers(model.config)
+    if actual is None:
+        raise ValueError(
+            f"Could not read layer count from config for '{model_name}'."
+        )
+    if actual != expected:
+        warnings.warn(
+            f"Layer count mismatch for '{model_name}': "
+            f"expected {expected}, config reports {actual}."
+        )
+        raise ValueError(
+            f"Layer count mismatch for '{model_name}': "
+            f"expected {expected}, config reports {actual}."
+        )
 
 
 class EmbeddingType(Enum):
@@ -76,16 +149,27 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
     available_models = None
 
-    def __init__(self, model, tokenizer):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        repr_layer: int | None = None,
+        model_name: str = "",
+    ):
         super().__init__()
         self.model = model
         self.model.eval()
         self.tokenizer = tokenizer
+        num_layers = model.config.num_hidden_layers
+        self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
+        validate_repr_layer(
+            self.repr_layer, num_layers, model_name=model_name or type(self).__name__
+        )
 
     def _validate_model_name(self, model_name):
-        assert (
-            self.available_models is None or model_name in self.available_models
-        ), f"Unknown model name '{model_name}'. Available options are {self.available_models}"
+        assert self.available_models is None or model_name in self.available_models, (
+            f"Unknown model name '{model_name}'. Available options are {self.available_models}"
+        )
 
     def prepare_sequences(self, sequences, structures=None):
 
@@ -102,21 +186,22 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
     def forward(self, input):
         attn_mask = input["attention_mask"]
 
-        output = self.model(**input)
-
-        embeddings = output.last_hidden_state.cpu()
+        output = self.model(**input, output_hidden_states=True)
+        hidden_states = output.hidden_states
         seq_lens = (attn_mask == 1).sum(-1)
 
-        for embed, seq_len in zip(embeddings, seq_lens):
-
-            yield self._post_process_embedding(embed, seq_len)
+        for i, seq_len in enumerate(seq_lens):
+            embed = _hf_hidden_at_layer(hidden_states, self.repr_layer)[i]
+            yield self._post_process_embedding(embed.cpu(), seq_len)
 
 
 class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
     available_models = ["prot_bert", "prot_bert_bfd"]
     structure_aware = False
 
-    def __init__(self, model_name: str, load_weights: bool = True):
+    def __init__(
+        self, model_name: str, load_weights: bool = True, repr_layer: int | None = None
+    ):
         self._validate_model_name(model_name)
 
         mode_name = f"Rostlab/{model_name}"
@@ -124,10 +209,15 @@ class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
             BertModel, BertTokenizer, mode_name, load_weights=load_weights
         )
 
-        super().__init__(model=model, tokenizer=tokenizer)
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            repr_layer=repr_layer,
+            model_name=model_name,
+        )
 
     def _post_process_embedding(self, embed, seq_len):
-        return embed[1: seq_len - 1]
+        return embed[1 : seq_len - 1]
 
 
 class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
@@ -139,7 +229,9 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
     ]
     structure_aware = False
 
-    def __init__(self, model_name: str, load_weights: bool = True):
+    def __init__(
+        self, model_name: str, load_weights: bool = True, repr_layer: int | None = None
+    ):
         self._validate_model_name(model_name)
 
         mode_name = f"Rostlab/{model_name}"
@@ -147,7 +239,12 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
             T5EncoderModel, T5Tokenizer, mode_name, load_weights=load_weights
         )
 
-        super().__init__(model=model, tokenizer=tokenizer)
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            repr_layer=repr_layer,
+            model_name=model_name,
+        )
 
     def _post_process_embedding(self, embedding, seq_len):
         return embedding[: seq_len - 1]
@@ -159,16 +256,18 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     # ESM2-style models in HAIPR use "<eos>" as chain break token.
     chain_break_token: str = "<eos>"
 
-    def __init__(self, model_name: str, repr_layer: int):
+    def __init__(self, model_name: str, repr_layer: int | None = None):
         super().__init__()
 
+        num_layers = _esm2_num_layers_from_name(model_name)
+        self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
+        validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
+
         self.model = EsmModel.from_pretrained("facebook/" + model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "facebook/" + model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained("facebook/" + model_name)
 
         self.model.eval()
-
-        self.repr_layer = repr_layer
+        _assert_hf_num_hidden_layers(self.model, num_layers, model_name=model_name)
 
     def clean(self, seq):
         if not re.match(r"^[ACDEFGHIKLMNPQRSTVWYX]+$", seq):
@@ -189,13 +288,15 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     @torch.no_grad()
     def forward(self, input):
         logger.debug(f"Input: {input}")
-        results = self.model(**input, output_hidden_states=False)
-        token_representations = results["last_hidden_state"]
+        results = self.model(**input, output_hidden_states=True)
+        token_representations = _hf_hidden_at_layer(
+            results.hidden_states, self.repr_layer
+        )
 
         seq_lengths = input["attention_mask"].sum(1)
 
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, 1: seq_len - 1]
+            yield token_representations[i, 1 : seq_len - 1]
 
 
 def _create_filtered_protein_complex(
@@ -227,21 +328,34 @@ def _create_filtered_protein_complex(
 
 class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
     """ESM3 embedder; batches must contain sequences of the same length (no padding)."""
+
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
     requires_same_length_batch = True
     # ProtEnc ESM3 expects "|" as the multi-chain separator.
     chain_break_token: str = "|"
 
-    def __init__(self, model_name: str, use_norm_layer: bool = True):
+    def __init__(
+        self,
+        model_name: str,
+        use_norm_layer: bool = True,
+        repr_layer: int | None = None,
+    ):
         super().__init__()
         self.model: ESM3 = ESM3.from_pretrained(model_name)
         self.model.eval()
         self.use_norm_layer = use_norm_layer
         self.model_name = model_name
+        num_layers = len(self.model.transformer.blocks)
+        self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
+        validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
 
     def _get_model(self):
-        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        return (
+            self.model.module
+            if isinstance(self.model, torch.nn.DataParallel)
+            else self.model
+        )
 
     def prepare_sequences(
         self,
@@ -310,7 +424,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                         structure = pdb_file.get_structure()
                         models = (
                             structure[0]
-                            if hasattr(structure, "stack_depth") and structure.stack_depth() > 0
+                            if hasattr(structure, "stack_depth")
+                            and structure.stack_depth() > 0
                             else structure
                         )
                         all_chain_ids = []
@@ -387,6 +502,109 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             }
         return {k: v for k, v in inputs_for_model.items() if v is not None}
 
+    def _esm3_transformer_hidden_states(
+        self, model: ESM3, inputs: dict
+    ) -> tuple[torch.Tensor, ...]:
+        """Run ESM3 encoder + transformer and return per-block hidden states."""
+        from esm.utils.constants import esm3 as C
+        from esm.utils.structure.affine3d import build_affine3d_from_coordinates
+
+        sequence_tokens = inputs.get("sequence_tokens")
+        structure_tokens = inputs.get("structure_tokens")
+        ss8_tokens = inputs.get("ss8_tokens")
+        sasa_tokens = inputs.get("sasa_tokens")
+        function_tokens = inputs.get("function_tokens")
+        residue_annotation_tokens = inputs.get("residue_annotation_tokens")
+        average_plddt = inputs.get("average_plddt")
+        per_res_plddt = inputs.get("per_res_plddt")
+        structure_coords = inputs.get("structure_coords")
+        chain_id = inputs.get("chain_id")
+        sequence_id = inputs.get("sequence_id")
+
+        try:
+            L, device = next(
+                (x.shape[1], x.device)
+                for x in [
+                    sequence_tokens,
+                    structure_tokens,
+                    ss8_tokens,
+                    sasa_tokens,
+                    structure_coords,
+                    function_tokens,
+                    residue_annotation_tokens,
+                ]
+                if x is not None
+            )
+        except StopIteration:
+            raise ValueError("At least one of the inputs must be non-None")
+
+        batch_size = sequence_tokens.shape[0] if sequence_tokens is not None else 1
+        t = model.tokenizers
+
+        def defaults(x, tok):
+            if x is None:
+                return torch.full(
+                    (batch_size, L), tok, dtype=torch.long, device=device
+                )
+            return x
+        sequence_tokens = defaults(sequence_tokens, t.sequence.mask_token_id)
+        ss8_tokens = defaults(ss8_tokens, C.SS8_PAD_TOKEN)
+        sasa_tokens = defaults(sasa_tokens, C.SASA_PAD_TOKEN)
+        average_plddt = defaults(average_plddt, 1).float()
+        per_res_plddt = defaults(per_res_plddt, 0).float()
+        chain_id = defaults(chain_id, 0)
+
+        if residue_annotation_tokens is None:
+            residue_annotation_tokens = torch.full(
+                (batch_size, L, 16), C.RESIDUE_PAD_TOKEN, dtype=torch.long, device=device
+            )
+
+        if function_tokens is None:
+            function_tokens = torch.full(
+                (batch_size, L, 8), C.INTERPRO_PAD_TOKEN, dtype=torch.long, device=device
+            )
+
+        if structure_coords is None:
+            structure_coords = torch.full(
+                (batch_size, L, 3, 3), float("nan"), dtype=torch.float, device=device
+            )
+
+        structure_coords = structure_coords[..., :3, :]
+        affine, affine_mask = build_affine3d_from_coordinates(structure_coords)
+
+        structure_tokens = defaults(structure_tokens, C.STRUCTURE_MASK_TOKEN)
+        assert structure_tokens is not None
+        structure_tokens = (
+            structure_tokens.masked_fill(structure_tokens == -1, C.STRUCTURE_MASK_TOKEN)
+            .masked_fill(sequence_tokens == C.SEQUENCE_BOS_TOKEN, C.STRUCTURE_BOS_TOKEN)
+            .masked_fill(sequence_tokens == C.SEQUENCE_PAD_TOKEN, C.STRUCTURE_PAD_TOKEN)
+            .masked_fill(sequence_tokens == C.SEQUENCE_EOS_TOKEN, C.STRUCTURE_EOS_TOKEN)
+            .masked_fill(
+                sequence_tokens == C.SEQUENCE_CHAINBREAK_TOKEN,
+                C.STRUCTURE_CHAINBREAK_TOKEN,
+            )
+        )
+
+        x = model.encoder(
+            sequence_tokens,
+            structure_tokens,
+            average_plddt,
+            per_res_plddt,
+            ss8_tokens,
+            sasa_tokens,
+            function_tokens,
+            residue_annotation_tokens,
+        )
+        _, _, hidden_states, _ = model.transformer(
+            x,
+            sequence_id,
+            affine,
+            affine_mask,
+            chain_id,
+            output_attentions=False,
+        )
+        return hidden_states
+
     @torch.no_grad()
     def forward(self, input):
         """
@@ -415,8 +633,11 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             if device.type == "cuda"
             else contextlib.nullcontext()
         ):
-            output = model(**inputs)
-        embeddings = output.embeddings
+            hidden_states = self._esm3_transformer_hidden_states(model, inputs)
+        num_layers = len(hidden_states)
+        embeddings = _esm3_hidden_at_layer(hidden_states, self.repr_layer)
+        if self.use_norm_layer and self.repr_layer == num_layers:
+            embeddings = model.transformer.norm(embeddings)
         if embeddings.dtype == torch.bfloat16:
             embeddings = embeddings.float()
 
@@ -430,10 +651,15 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     structure_aware = False
     chain_break_token: str = "|"
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, repr_layer: int | None = None):
         super().__init__()
+        num_layers = _esmc_num_layers_from_name(model_name)
+        self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
+        validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
+
         self.model, self.tokenizer = load_esmc(model_name)
         self.pad_idx = self.tokenizer.pad_token_id
+        _assert_hf_num_hidden_layers(self.model, num_layers, model_name=model_name)
 
     def prepare_sequences(self, sequences, structures=None):
         return tokenize_esmc_sequences(self.tokenizer, sequences)
@@ -444,7 +670,7 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         attention_mask = inputs.get("attention_mask")
         if attention_mask is None:
             attention_mask = inputs["input_ids"] != self.pad_idx
-        embeddings = esmc_last_hidden_state(self.model, inputs)
+        embeddings = esmc_hidden_at_layer(self.model, inputs, self.repr_layer)
 
         for i in range(embeddings.shape[0]):
             x = embeddings[i][attention_mask[i].bool()]
@@ -452,22 +678,21 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
 
 
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
-
     embedding_kind = EmbeddingType.PER_PROTEIN
     structure_aware = False
 
-    def __init__(self, model_name: str, repr_layer: int):
+    def __init__(self, model_name: str, repr_layer: int | None = None):
         super().__init__()
 
         self.model, self.collater = load_model_and_alphabet(model_name)
         self.model.eval()
-        self.repr_layer = repr_layer
+        num_layers = int(self.model.num_layers)
+        self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
+        validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
 
     def prepare_sequences(self, sequences, structures=None):
         logger.debug(f"Sequences: {sequences}")
-        sequences = [
-            [s] for s in sequences
-        ]
+        sequences = [[s] for s in sequences]
 
         batch_tokens = self.collater(sequences)[0]
         logger.debug(f"batch: {batch_tokens}")
@@ -478,8 +703,7 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
     def forward(self, input):
         logger.debug(f"Input: {input}")
         tokens = input["tokens"]
-        results = self.model(tokens, repr_layers=[
-                             self.repr_layer], logits=False)
+        results = self.model(tokens, repr_layers=[self.repr_layer], logits=False)
         token_representations = results["representations"][self.repr_layer]
         seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)
         logger.debug(f"Token representations: {token_representations}")
@@ -493,19 +717,19 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
     structure_aware = True
 
-    def __init__(self, model_name: str, ca_only: bool = False, use_structure: bool = True):
+    def __init__(
+        self, model_name: str, ca_only: bool = False, use_structure: bool = True
+    ):
         super().__init__()
-        print(
-            f"Initializing ProteinMPNN embedding model with model name: {model_name}")
+        print(f"Initializing ProteinMPNN embedding model with model name: {model_name}")
 
         cache_dir = torch.hub.get_dir()
-        if os.path.exists(os.path.join(cache_dir, "ProteinMPNN", "weights", model_name)):
-            model_name = os.path.join(
-                cache_dir, "ProteinMPNN", "weights", model_name)
+        if os.path.exists(
+            os.path.join(cache_dir, "ProteinMPNN", "weights", model_name)
+        ):
+            model_name = os.path.join(cache_dir, "ProteinMPNN", "weights", model_name)
         else:
-
-            model_name = os.path.join(os.path.dirname(
-                __file__), "weights", model_name)
+            model_name = os.path.join(os.path.dirname(__file__), "weights", model_name)
         print(f"Loading ProteinMPNN model from {model_name}")
         self.model = ProteinMPNN.from_pretrained(model_name, ca_only=ca_only)
         self.model.eval()
@@ -536,8 +760,9 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
             pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
         else:
             # List of PDB paths: use first for structure, batch from all if no sequences
-            pdb_dict_list = parse_PDB(
-                structures[0], ca_only=self.ca_only) if structures else []
+            pdb_dict_list = (
+                parse_PDB(structures[0], ca_only=self.ca_only) if structures else []
+            )
         logger.debug(f"pdb_dict_list: {len(pdb_dict_list)}")
         if not pdb_dict_list:
             raise ValueError(
@@ -547,8 +772,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         pdb_dict = pdb_dict_list[0]
         pdb_seq_len = len(pdb_dict.get("seq", ""))
 
-        chain_keys = [key for key in pdb_dict.keys(
-        ) if key.startswith("seq_chain_")]
+        chain_keys = [key for key in pdb_dict.keys() if key.startswith("seq_chain_")]
         chain_letters = [key.replace("seq_chain_", "") for key in chain_keys]
 
         if sequences:
@@ -568,7 +792,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
                         chain_key = f"seq_chain_{letter}"
                         if chain_key in pdb_dict:
                             chain_len = len(pdb_dict[chain_key])
-                            seq_dict[chain_key] = seq[start_idx: start_idx + chain_len]
+                            seq_dict[chain_key] = seq[start_idx : start_idx + chain_len]
                             start_idx += chain_len
                 batch.append(seq_dict)
         elif not isinstance(structures, str) and structures:
@@ -582,19 +806,25 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
             batch = [pdb_dict]
 
         featurized = tied_featurize(
-            batch, device, chain_dict=None, fixed_position_dict=None,
-            omit_AA_dict=None, tied_positions_dict=None, pssm_dict=None,
-            bias_by_res_dict=None, ca_only=self.ca_only
+            batch,
+            device,
+            chain_dict=None,
+            fixed_position_dict=None,
+            omit_AA_dict=None,
+            tied_positions_dict=None,
+            pssm_dict=None,
+            bias_by_res_dict=None,
+            ca_only=self.ca_only,
         )
 
         return {
-            'X': featurized[0],
-            'S': featurized[1],
-            'mask': featurized[2],
-            'chain_M': featurized[4],
-            'residue_idx': featurized[12],
-            'chain_encoding_all': featurized[5],
-            'lengths': featurized[3],
+            "X": featurized[0],
+            "S": featurized[1],
+            "mask": featurized[2],
+            "chain_M": featurized[4],
+            "residue_idx": featurized[12],
+            "chain_encoding_all": featurized[5],
+            "lengths": featurized[3],
         }
 
     @torch.no_grad()
@@ -609,15 +839,14 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
             Embeddings for each sequence (per-residue)
         """
         device = next(self.model.parameters()).device
-        X = input['X'].to(device)
-        S = input['S'].to(device)
-        mask = input['mask'].to(device)
-        residue_idx = input['residue_idx'].to(device)
-        chain_encoding_all = input['chain_encoding_all'].to(device)
-        lengths = input['lengths']
+        X = input["X"].to(device)
+        S = input["S"].to(device)
+        mask = input["mask"].to(device)
+        residue_idx = input["residue_idx"].to(device)
+        chain_encoding_all = input["chain_encoding_all"].to(device)
+        lengths = input["lengths"]
 
-        E, E_idx = self.model.features(
-            X, mask, residue_idx, chain_encoding_all)
+        E, E_idx = self.model.features(X, mask, residue_idx, chain_encoding_all)
         h_S = self.model.W_s(S)
         h_V = h_S.clone()
         h_E = self.model.W_e(E)
@@ -640,6 +869,8 @@ class ModelCard:
     family: str
     embed_dim: int
     init_fn: Callable[[], BaseProteinEmbeddingModel]
+    num_layers: int | None = None
+    supports_repr_layer: bool = True
 
     @classmethod
     def from_model_cls(cls, *, model_cls, model_kwargs, **kwargs):
@@ -650,15 +881,14 @@ class ModelCard:
 
 
 model_descriptions = [
-
     ModelCard.from_model_cls(
         name="carp",
         family="CARP",
         embed_dim=1280,
+        num_layers=56,
         model_cls=CarpEmbeddingModel,
-        model_kwargs=dict(model_name="carp_640M", repr_layer=56),
+        model_kwargs=dict(model_name="carp_640M"),
     ),
-
     ModelCard.from_model_cls(
         name="prot_t5_xl_uniref50",
         family="ProtTrans",
@@ -701,54 +931,59 @@ model_descriptions = [
         model_cls=ProtBERTEmbeddingModel,
         model_kwargs=dict(model_name="prot_bert"),
     ),
-
     ModelCard.from_model_cls(
         name="esm2_t48",
         family="ESM",
         embed_dim=5120,
+        num_layers=48,
         model_cls=ESMEmbeddingModel,
-        model_kwargs=dict(model_name="esm2_t48_15B_UR50D", repr_layer=48),
+        model_kwargs=dict(model_name="esm2_t48_15B_UR50D"),
     ),
     ModelCard.from_model_cls(
         name="esm2_t36",
         family="ESM",
         embed_dim=2560,
+        num_layers=36,
         model_cls=ESMEmbeddingModel,
-        model_kwargs=dict(model_name="esm2_t36_3B_UR50D", repr_layer=36),
+        model_kwargs=dict(model_name="esm2_t36_3B_UR50D"),
     ),
     ModelCard.from_model_cls(
         name="esm2_t33",
         family="ESM",
         embed_dim=1280,
+        num_layers=33,
         model_cls=ESMEmbeddingModel,
-        model_kwargs=dict(model_name="esm2_t33_650M_UR50D", repr_layer=33),
+        model_kwargs=dict(model_name="esm2_t33_650M_UR50D"),
     ),
     ModelCard.from_model_cls(
         name="esm2_t30",
         family="ESM",
         embed_dim=640,
+        num_layers=30,
         model_cls=ESMEmbeddingModel,
-        model_kwargs=dict(model_name="esm2_t30_150M_UR50D", repr_layer=30),
+        model_kwargs=dict(model_name="esm2_t30_150M_UR50D"),
     ),
     ModelCard.from_model_cls(
         name="esm2_t12",
         family="ESM",
         embed_dim=480,
+        num_layers=12,
         model_cls=ESMEmbeddingModel,
-        model_kwargs=dict(model_name="esm2_t12_35M_UR50D", repr_layer=12),
+        model_kwargs=dict(model_name="esm2_t12_35M_UR50D"),
     ),
     ModelCard.from_model_cls(
         name="esm2_t6",
         family="ESM",
         embed_dim=320,
+        num_layers=6,
         model_cls=ESMEmbeddingModel,
-        model_kwargs=dict(model_name="esm2_t6_8M_UR50D", repr_layer=6),
+        model_kwargs=dict(model_name="esm2_t6_8M_UR50D"),
     ),
-
     ModelCard.from_model_cls(
         name="esmc_600m",
         family="ESM",
         embed_dim=1152,
+        num_layers=36,
         model_cls=ESMCEmbeddingModel,
         model_kwargs=dict(model_name="esmc_600m"),
     ),
@@ -756,6 +991,7 @@ model_descriptions = [
         name="esmc_6b",
         family="ESM",
         embed_dim=2560,
+        num_layers=80,
         model_cls=ESMCEmbeddingModel,
         model_kwargs=dict(model_name="esmc_6b"),
     ),
@@ -763,6 +999,7 @@ model_descriptions = [
         name="esmc_300m",
         family="ESM",
         embed_dim=960,
+        num_layers=30,
         model_cls=ESMCEmbeddingModel,
         model_kwargs=dict(model_name="esmc_300m"),
     ),
@@ -770,22 +1007,22 @@ model_descriptions = [
         name="esm3",
         family="ESM",
         embed_dim=1536,
+        num_layers=48,
         model_cls=ESM3EmbeddingModel,
         model_kwargs=dict(model_name="esm3_sm_open_v1", use_norm_layer=True),
     ),
-
     ModelCard.from_model_cls(
         name="mpnn",
         family="ProteinMPNN",
         embed_dim=128,
+        supports_repr_layer=False,
         model_cls=ProteinMPNNEmbeddingModel,
         model_kwargs=dict(model_name="v_48_020.pt", ca_only=True),
     ),
 ]
 
 
-model_dict: dict[str, ModelCard] = OrderedDict(
-    (m.name, m) for m in model_descriptions)
+model_dict: dict[str, ModelCard] = OrderedDict((m.name, m) for m in model_descriptions)
 
 model_families = set(m.family for m in model_descriptions)
 
@@ -814,10 +1051,37 @@ def get_model_info(model_name: str):
         "name": model_desc.name,
         "family": model_desc.family,
         "embed_dim": model_desc.embed_dim,
+        "num_layers": model_desc.num_layers,
+        "default_repr_layer": model_desc.num_layers,
+        "supports_repr_layer": model_desc.supports_repr_layer,
     }
 
 
-def get_model(model_name, **kwargs):
-    model = model_dict[model_name].init_fn(**kwargs)
+def get_model(model_name, repr_layer=None, **kwargs):
+    if model_name not in model_dict:
+        raise ValueError(
+            f"Unknown model '{model_name}'. Available models are {list_models()}"
+        )
+
+    model_desc = model_dict[model_name]
+    init_kwargs = dict(kwargs)
+    if repr_layer is not None:
+        init_kwargs["repr_layer"] = repr_layer
+
+    if not model_desc.supports_repr_layer and init_kwargs.get("repr_layer") is not None:
+        warnings.warn(
+            f"Model '{model_name}' does not support repr_layer configuration."
+        )
+        raise ValueError(
+            f"Model '{model_name}' does not support repr_layer configuration."
+        )
+
+    if model_desc.num_layers is not None:
+        effective = resolve_repr_layer(
+            init_kwargs.get("repr_layer"), model_desc.num_layers
+        )
+        validate_repr_layer(effective, model_desc.num_layers, model_name=model_name)
+
+    model = model_desc.init_fn(**init_kwargs)
 
     return model
