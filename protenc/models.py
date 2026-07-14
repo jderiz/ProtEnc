@@ -21,6 +21,8 @@ import re
 from haipr.models.esmc_loading import (
     ESMC_HF_REPOS,
     esmc_hidden_at_layer,
+    esmc_hidden_states,
+    esmc_select_hidden_layer,
     hf_config_num_layers,
     load_esmc,
     tokenize_esmc_sequences,
@@ -62,6 +64,42 @@ def validate_repr_layer(repr_layer: int, num_layers: int, *, model_name: str) ->
             f"repr_layer={repr_layer} is invalid for '{model_name}': "
             f"valid range is 1..{num_layers}."
         )
+
+
+def parse_repr_layers_config(
+    repr_layer: int | None,
+    repr_layers: list[int] | None,
+    num_layers: int,
+    *,
+    model_name: str,
+) -> list[int]:
+    """
+    Normalize ``repr_layer`` / ``repr_layers`` config into a sorted unique layer list.
+
+    When ``repr_layers`` is provided it takes precedence and ``repr_layer`` is ignored.
+    Otherwise a single layer is resolved from ``repr_layer`` (or the model's final layer).
+    Every returned layer is validated against ``num_layers``.
+    """
+    if repr_layers:
+        layers = sorted({int(layer) for layer in repr_layers})
+    else:
+        layers = [resolve_repr_layer(repr_layer, num_layers)]
+
+    for layer in layers:
+        validate_repr_layer(layer, num_layers, model_name=model_name)
+
+    return layers
+
+
+def layer_output_path(path, layer: int):
+    """Insert a ``_layer{N}`` suffix before the file extension of ``path``."""
+    from pathlib import Path
+
+    p = Path(path)
+    new_name = f"{p.stem}_layer{layer}{p.suffix}"
+    return type(path)(p.with_name(new_name)) if isinstance(path, str) else p.with_name(
+        new_name
+    )
 
 
 def _esm2_num_layers_from_name(name: str) -> int:
@@ -121,6 +159,8 @@ class BaseProteinEmbeddingModel(nn.Module):
     embedding_type: EmbeddingType
     # Default: no explicit chain break token. Specific models may override.
     chain_break_token: str = ""
+    # Layers to extract in the multi-layer path; set by get_model when configured.
+    repr_layers: list[int] | None = None
 
     def prepare_sequences(self, sequences, structures=None):
         return NotImplementedError
@@ -193,6 +233,19 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         for i, seq_len in enumerate(seq_lens):
             embed = _hf_hidden_at_layer(hidden_states, self.repr_layer)[i]
             yield self._post_process_embedding(embed.cpu(), seq_len)
+
+    @torch.no_grad()
+    def forward_multi(self, input, repr_layers: list[int]):
+        attn_mask = input["attention_mask"]
+
+        output = self.model(**input, output_hidden_states=True)
+        hidden_states = output.hidden_states
+        seq_lens = (attn_mask == 1).sum(-1)
+
+        for i, seq_len in enumerate(seq_lens):
+            for layer in repr_layers:
+                embed = _hf_hidden_at_layer(hidden_states, layer)[i]
+                yield i, layer, self._post_process_embedding(embed.cpu(), seq_len)
 
 
 class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
@@ -297,6 +350,19 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
 
         for i, seq_len in enumerate(seq_lengths):
             yield token_representations[i, 1 : seq_len - 1]
+
+    @torch.no_grad()
+    def forward_multi(self, input, repr_layers: list[int]):
+        logger.debug(f"Input: {input}")
+        results = self.model(**input, output_hidden_states=True)
+        seq_lengths = input["attention_mask"].sum(1)
+
+        for i, seq_len in enumerate(seq_lengths):
+            for layer in repr_layers:
+                token_representations = _hf_hidden_at_layer(
+                    results.hidden_states, layer
+                )
+                yield i, layer, token_representations[i, 1 : seq_len - 1]
 
 
 def _create_filtered_protein_complex(
@@ -645,6 +711,35 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         for i in range(batch_size):
             yield embeddings[i, 1:-1].cpu()
 
+    @torch.no_grad()
+    def forward_multi(self, input, repr_layers: list[int]):
+        device = next(self.model.parameters()).device
+        model = self._get_model()
+
+        inputs = {"sequence_tokens": input["sequence_tokens"].to(device)}
+        if "structure_tokens" in input and input["structure_tokens"] is not None:
+            inputs["structure_tokens"] = input["structure_tokens"].to(device)
+        inputs = {k: v for k, v in inputs.items() if v is not None}
+
+        with (
+            torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        ):
+            hidden_states = self._esm3_transformer_hidden_states(model, inputs)
+        num_layers = len(hidden_states)
+
+        for layer in repr_layers:
+            embeddings = _esm3_hidden_at_layer(hidden_states, layer)
+            if self.use_norm_layer and layer == num_layers:
+                embeddings = model.transformer.norm(embeddings)
+            if embeddings.dtype == torch.bfloat16:
+                embeddings = embeddings.float()
+
+            batch_size = embeddings.shape[0]
+            for i in range(batch_size):
+                yield i, layer, embeddings[i, 1:-1].cpu()
+
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
@@ -675,6 +770,20 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         for i in range(embeddings.shape[0]):
             x = embeddings[i][attention_mask[i].bool()]
             yield x[1:-1].cpu()
+
+    @torch.no_grad()
+    def forward_multi(self, input, repr_layers: list[int]):
+        inputs = dict(input) if hasattr(input, "keys") else {"input_ids": input}
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = inputs["input_ids"] != self.pad_idx
+        hidden_states = esmc_hidden_states(self.model, inputs)
+
+        for layer in repr_layers:
+            embeddings = esmc_select_hidden_layer(hidden_states, layer)
+            for i in range(embeddings.shape[0]):
+                x = embeddings[i][attention_mask[i].bool()]
+                yield i, layer, x[1:-1].cpu()
 
 
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
@@ -711,6 +820,18 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
 
         for i, seq_len in enumerate(seq_lengths):
             yield token_representations[i, :seq_len]
+
+    @torch.no_grad()
+    def forward_multi(self, input, repr_layers: list[int]):
+        logger.debug(f"Input: {input}")
+        tokens = input["tokens"]
+        results = self.model(tokens, repr_layers=list(repr_layers), logits=False)
+        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)
+
+        for i, seq_len in enumerate(seq_lengths):
+            for layer in repr_layers:
+                token_representations = results["representations"][layer]
+                yield i, layer, token_representations[i, :seq_len]
 
 
 class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
@@ -1057,7 +1178,7 @@ def get_model_info(model_name: str):
     }
 
 
-def get_model(model_name, repr_layer=None, **kwargs):
+def get_model(model_name, repr_layer=None, repr_layers=None, **kwargs):
     if model_name not in model_dict:
         raise ValueError(
             f"Unknown model '{model_name}'. Available models are {list_models()}"
@@ -1065,10 +1186,20 @@ def get_model(model_name, repr_layer=None, **kwargs):
 
     model_desc = model_dict[model_name]
     init_kwargs = dict(kwargs)
-    if repr_layer is not None:
+
+    layers = None
+    if model_desc.num_layers is not None:
+        layers = parse_repr_layers_config(
+            repr_layer, repr_layers, model_desc.num_layers, model_name=model_name
+        )
+        # Initialize the underlying model with the highest requested layer so that
+        # the single-layer forward() path remains consistent with repr_layer.
+        init_kwargs["repr_layer"] = layers[-1]
+    elif repr_layer is not None:
         init_kwargs["repr_layer"] = repr_layer
 
-    if not model_desc.supports_repr_layer and init_kwargs.get("repr_layer") is not None:
+    requests_repr_layer = repr_layer is not None or bool(repr_layers)
+    if not model_desc.supports_repr_layer and requests_repr_layer:
         warnings.warn(
             f"Model '{model_name}' does not support repr_layer configuration."
         )
@@ -1076,12 +1207,9 @@ def get_model(model_name, repr_layer=None, **kwargs):
             f"Model '{model_name}' does not support repr_layer configuration."
         )
 
-    if model_desc.num_layers is not None:
-        effective = resolve_repr_layer(
-            init_kwargs.get("repr_layer"), model_desc.num_layers
-        )
-        validate_repr_layer(effective, model_desc.num_layers, model_name=model_name)
-
     model = model_desc.init_fn(**init_kwargs)
+
+    if layers is not None:
+        model.repr_layers = layers
 
     return model

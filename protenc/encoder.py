@@ -180,6 +180,14 @@ class ProteinEncoder:
             model = model.module
         return getattr(model, "repr_layer", None)
 
+    @property
+    def repr_layers(self) -> list[int] | None:
+        """Layers extracted in the multi-layer path (None for single-layer)."""
+        model = self.model
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        return getattr(model, "repr_layers", None)
+
     def _iter_batches(self, proteins: list[str]):
         """Iterate (batch_indices, batch_sequences). Same-length models: group by length then chunk; else consecutive chunks."""
         assert isinstance(self.batch_size, int), "batch size must be an integer"
@@ -232,6 +240,16 @@ class ProteinEncoder:
         ):
             # calls model.forward()
             return self.model(batch)
+
+    def _encode_multi(self, batch, repr_layers: list[int]):
+        """Process a batch through model.forward_multi for multiple layers."""
+        model = self.model
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        with torch.inference_mode(), torch.amp.autocast(
+            device_type="cuda", enabled=self.autocast
+        ):
+            return model.forward_multi(batch, repr_layers)
 
     def _encode_batches(
         self,
@@ -312,6 +330,61 @@ class ProteinEncoder:
                         out = utils.to_return_format(embed.cpu(), return_format)
                         del embed
                         yield (batch_indices[i], out)
+                        pbar_embed.update(1)
+                finally:
+                    del model_output
+                    del batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        finally:
+            pbar_embed.close()
+
+    def encode_multi_layer(
+        self,
+        proteins: list[str],
+        repr_layers: list[int],
+        structures=None,
+        average_sequence: bool = False,
+        return_format: ReturnFormat = "torch",
+        chain_list=None,
+        structure_id=None,
+    ):
+        """
+        Encode proteins for multiple layers in a single forward pass per batch.
+
+        Yields (index, layer, embed) so the consumer can route each layer to its
+        own writer. Preparation mirrors ``_encode_two_phase`` phase 1.
+        """
+        target_device = self._get_primary_device()
+        n = len(proteins)
+        stored_batches = []
+
+        pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
+        try:
+            for batch_indices, batch_sequences in self._iter_batches(proteins):
+                prepared_batch = self.prepare_sequences(
+                    batch_sequences,
+                    structures,
+                    chain_list=chain_list,
+                    structure_id=structure_id,
+                )
+                stored_batches.append((batch_indices, prepared_batch))
+                pbar_prepare.update(len(batch_indices))
+        finally:
+            pbar_prepare.close()
+
+        pbar_embed = tqdm(total=n * len(repr_layers), desc="Embedding", unit="emb")
+        try:
+            for batch_indices, prepared_batch in stored_batches:
+                batch = self._batch_to_device(prepared_batch, target_device)
+                model_output = self._encode_multi(batch, repr_layers)
+                try:
+                    for i, layer, embed in model_output:
+                        if average_sequence:
+                            embed = embed.mean(0)
+                        out = utils.to_return_format(embed.cpu(), return_format)
+                        del embed
+                        yield (batch_indices[i], layer, out)
                         pbar_embed.update(1)
                 finally:
                     del model_output
@@ -440,6 +513,7 @@ def get_encoder(
     model_name,
     device=None,
     repr_layer=None,
+    repr_layers=None,
     data_parallel=False,
     device_ids=None,
     **kwargs,
@@ -451,6 +525,7 @@ def get_encoder(
         model_name: Name of the model to load
         device: Device to place the model on
         repr_layer: Optional 1-indexed transformer layer for representations
+        repr_layers: Optional list of 1-indexed layers for multi-layer extraction
         data_parallel: Whether to use data parallel across all available GPUs
         device_ids: Optional explicit GPU ids for DataParallel
         **kwargs: Additional arguments to pass to ProteinEncoder
@@ -458,7 +533,7 @@ def get_encoder(
     Returns:
         ProteinEncoder instance
     """
-    model = get_model(model_name, repr_layer=repr_layer)
+    model = get_model(model_name, repr_layer=repr_layer, repr_layers=repr_layers)
 
     # Validate and handle device parameter
     if device is not None:
