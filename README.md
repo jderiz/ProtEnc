@@ -77,6 +77,37 @@ Generate protein embeddings using the ESM2 650M model for sequences provided in 
 protenc proteins.fasta embeddings.lmdb --model_name=esm2_t33_650M_UR50D
 ```
 
+### MCP server (for AI agents)
+
+ProtEnc includes an MCP server so agents in Cursor, Claude Code, and other MCP clients can list models and embed protein sequences.
+
+Install the package (see Development), then register the server in your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "protenc": {
+      "command": "protenc-mcp",
+      "env": {
+        "PROTENC_DEFAULT_MODEL": "esm2_t30",
+        "PROTENC_DEVICE": "cuda"
+      }
+    }
+  }
+}
+```
+
+Available tools:
+
+* `protenc_list_models` — list supported embedding models
+* `protenc_get_model_info` — model family, embedding dimension, and layer count
+* `protenc_embed_sequences` — embed one or more amino-acid sequences
+
+Environment variables:
+
+* `PROTENC_DEFAULT_MODEL` — default model alias (default: `esm2_t30`)
+* `PROTENC_DEVICE` — torch device such as `cuda`, `cpu`, or `cuda:0`
+
 The generated embeddings will be stored in a lmdb key-value store and can be easily accessed using the `read_from_lmdb` utility function:
 
 ```python

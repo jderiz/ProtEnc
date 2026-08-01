@@ -4,12 +4,13 @@ version = "0.1.6"
 description = "Extract protein embeddings from protein language models."
 authors = ["Kristian Klemon <kristian.klemon@gmail.com>"]
 readme = "README.md"
-packages = [{include = "protenc"}]
+packages = [{include = "protenc"}, {include = "protenc_mcp"}]
 repository = "https://github.com/kklemon/ProtEnc"
 homepage = "https://github.com/kklemon/ProtEnc"
 
 [tool.poetry.scripts]
 protenc = 'protenc.console.extract:entrypoint'
+protenc-mcp = 'protenc_mcp.server:main'
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
@@ -22,6 +23,12 @@ json-stream = ">=2.3.2"
 humanfriendly = ">=10.0"
 pytest = ">=7.4.2"
 sequence_models = "*"
+mcp = ">=1.13,<2.0"
+colorlog = ">=6.7.0"
+h5py = ">=3.10.0"
+transformers = ">=4.33.3"
+torch = {version = ">=2.0.1", source = "pytorch-gpu-src"}
+esm = {git = "https://github.com/Biohub/esm.git", branch = "main"}
 # tensordict dependency has been removed
 
 [[tool.poetry.source]]

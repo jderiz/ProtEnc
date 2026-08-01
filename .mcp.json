@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "protenc": {
+      "command": "protenc-mcp",
+      "env": {
+        "PROTENC_DEFAULT_MODEL": "esm2_t30",
+        "PROTENC_DEVICE": "cuda"
+      }
+    }
+  }
+}
