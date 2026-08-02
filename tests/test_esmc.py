@@ -14,7 +14,7 @@ from protenc.models import (
     get_model,
     get_model_info,
 )
-from haipr.models.esmc_loading import ESMC_HF_REPOS, resolve_esmc_repo_id
+from protenc.esmc_loading import ESMC_HF_REPOS, resolve_esmc_repo_id
 
 
 @pytest.mark.parametrize(

@@ -18,10 +18,11 @@ from transformers import (
 from sequence_models.pretrained import load_model_and_alphabet
 import colorlog as logging
 import re
-from haipr.models.esmc_loading import (
+from protenc.esmc_loading import (
     ESMC_HF_REPOS,
     esmc_hidden_at_layer,
     esmc_hidden_states,
+    esmc_num_layers,
     esmc_select_hidden_layer,
     hf_config_num_layers,
     load_esmc,
@@ -129,6 +130,21 @@ def _hf_hidden_at_layer(hidden_states: tuple, repr_layer: int) -> torch.Tensor:
 
 def _esm3_hidden_at_layer(hidden_states: tuple, repr_layer: int) -> torch.Tensor:
     return hidden_states[repr_layer - 1]
+
+
+def _assert_esmc_num_layers(
+    model: nn.Module, expected: int, *, model_name: str
+) -> None:
+    actual = esmc_num_layers(model)
+    if actual != expected:
+        warnings.warn(
+            f"Layer count mismatch for '{model_name}': "
+            f"expected {expected}, model reports {actual}."
+        )
+        raise ValueError(
+            f"Layer count mismatch for '{model_name}': "
+            f"expected {expected}, model reports {actual}."
+        )
 
 
 def _assert_hf_num_hidden_layers(
@@ -754,10 +770,10 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
 
         self.model, self.tokenizer = load_esmc(model_name)
         self.pad_idx = self.tokenizer.pad_token_id
-        _assert_hf_num_hidden_layers(self.model, num_layers, model_name=model_name)
+        _assert_esmc_num_layers(self.model, num_layers, model_name=model_name)
 
     def prepare_sequences(self, sequences, structures=None):
-        return tokenize_esmc_sequences(self.tokenizer, sequences)
+        return tokenize_esmc_sequences(self.model, sequences)
 
     @torch.no_grad()
     def forward(self, input):
