@@ -45,7 +45,7 @@ def resolve_esmc_model_name(name: str) -> str:
 def load_esmc(model_name: str, *, use_flash_attn: bool = True) -> tuple[ESMC, Any]:
     """Load an ESMC model and tokenizer via ``ESMC.from_pretrained``."""
     resolved_name = resolve_esmc_model_name(model_name)
-    model = ESMC.from_pretrained(resolved_name, use_flash_attn=use_flash_attn)
+    model = ESMC.from_pretrained(resolved_name)
     model.eval()
     return model, model.tokenizer
 
