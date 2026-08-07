@@ -173,3 +173,6 @@ poetry.toml
 protenc/weights/logs
 logs/
 protenc/weights/
+
+# Git worktrees for parallel agent work
+.worktrees/
