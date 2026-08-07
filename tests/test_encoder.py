@@ -27,7 +27,7 @@ def test_encode(proteins, model_name, device):
     model_info = get_model_info(model_name)
     encoder = get_encoder(model_name, device=device)
 
-    for idx, embed in encoder(proteins):
+    for idx, embed in encoder(proteins, average_sequence=False):
         assert len(proteins[idx]) == len(embed)
         assert embed.shape[-1] == model_info['embed_dim']
 
@@ -62,6 +62,6 @@ def test_encode_dict(protein_dict, model_name, device):
     model_info = get_model_info(model_name)
     encoder = get_encoder(model_name, device=device)
 
-    for prot_id, embed in encoder(protein_dict):
+    for prot_id, embed in encoder(protein_dict, average_sequence=False):
         assert len(protein_dict[prot_id]) == len(embed)
         assert embed.shape[-1] == model_info['embed_dim']
