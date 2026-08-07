@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import textwrap
+import warnings
 import torch
 import torch.nn as nn
 import protenc
@@ -11,6 +12,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from protenc import io as io, utils
+from protenc.esmc_loading import is_esmc_model
 from protenc.models import EmbeddingType
 import colorlog as logging
 
@@ -78,6 +80,31 @@ def _postprocess_embedding(args, model, embedding):
     return embedding
 
 
+def _maybe_apply_data_parallel(model, data_parallel, device_ids):
+    """Wrap model with nn.DataParallel when requested.
+
+    Multi-GPU support uses torch.nn.DataParallel only; DistributedDataParallel (DDP) is not supported.
+    """
+    if not data_parallel:
+        return
+
+    is_esmc_model_flag = False
+    if hasattr(model, "model"):
+        if is_esmc_model(model.model):
+            is_esmc_model_flag = True
+    elif is_esmc_model(model):
+        is_esmc_model_flag = True
+
+    if is_esmc_model_flag:
+        warnings.warn(
+            "DataParallel is not supported for ESMC models due to ESMCOutput compatibility issues. "
+            "Falling back to single GPU for ESMC models."
+        )
+        return
+
+    model.model = nn.DataParallel(model.model, device_ids=device_ids or None)
+
+
 def _build_batches(args, model):
     input_reader = args.input_reader_cls.from_args(args.input_path, args)
 
@@ -124,10 +151,7 @@ def main(args):
     batches = _build_batches(args, model)
 
     if "cuda" in args.device:
-        if args.data_parallel:
-            model.model = nn.DataParallel(
-                model.model, device_ids=args.device_ids or None
-            )
+        _maybe_apply_data_parallel(model, args.data_parallel, args.device_ids)
 
     model = model.to(args.device)
 
@@ -171,10 +195,7 @@ def main_multi_layer(args, repr_layers):
     batches = _build_batches(args, model)
 
     if "cuda" in args.device:
-        if args.data_parallel:
-            model.model = nn.DataParallel(
-                model.model, device_ids=args.device_ids or None
-            )
+        _maybe_apply_data_parallel(model, args.data_parallel, args.device_ids)
 
     model = model.to(args.device)
 
