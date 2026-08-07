@@ -26,6 +26,7 @@ class ProteinEncoder:
         dataloader: DataLoader = DataLoader,
         data_parallel: bool = False,
         device_ids: list[int] | None = None,
+        empty_cache_on_batch: bool = False,
     ):
         """
         Initialize the protein encoder.
@@ -34,10 +35,14 @@ class ProteinEncoder:
             model: The protein embedding model to use
             batch_size: Batch size for processing (default: 1)
             autocast: Whether to use automatic mixed precision
-            preprocess_workers: Number of workers for data preprocessing
+            preprocess_workers: Number of workers for data preprocessing. Not yet
+                implemented; values greater than 0 are accepted but ignored.
             dataloader: DataLoader class to use
             data_parallel: Whether to use data parallel across all available GPUs
             device_ids: Optional explicit GPU ids for DataParallel (default: all visible GPUs)
+            empty_cache_on_batch: If True, call ``torch.cuda.empty_cache()`` after each
+                batch during encoding. Defaults to False because per-batch cache clearing
+                hurts throughput; cache is still cleared on CUDA OOM recovery.
         """
         self.model = model
         self.batch_size = 1 if batch_size is None else batch_size
@@ -47,6 +52,7 @@ class ProteinEncoder:
         self.dataloader = dataloader
         self.data_parallel = data_parallel
         self.device_ids = device_ids
+        self.empty_cache_on_batch = empty_cache_on_batch
 
         # Apply data parallel if requested and CUDA is available
         if self.data_parallel and torch.cuda.is_available():
@@ -229,10 +235,23 @@ class ProteinEncoder:
         except (AttributeError, TypeError):
             return self.model.prepare_sequences(proteins, structures=structures)
 
+    def _maybe_empty_cache(self, *, force: bool = False) -> None:
+        """Clear CUDA cache when requested or after OOM recovery."""
+        if (force or self.empty_cache_on_batch) and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _run_encode_with_oom_recovery(self, encode_fn):
+        """Run an encode callable, clearing CUDA cache and retrying once on OOM."""
+        try:
+            return encode_fn()
+        except torch.cuda.OutOfMemoryError:
+            self._maybe_empty_cache(force=True)
+            return encode_fn()
+
     def _encode(self, batch):
         """Process a batch through the model and return embeddings."""
         with torch.inference_mode(), torch.amp.autocast(
-            device_type="cuda", enabled=self.autocast
+            device_type=self.device.type, enabled=self.autocast
         ):
             # calls model.forward()
             return self.model(batch)
@@ -243,7 +262,7 @@ class ProteinEncoder:
         if isinstance(model, nn.DataParallel):
             model = model.module
         with torch.inference_mode(), torch.amp.autocast(
-            device_type="cuda", enabled=self.autocast
+            device_type=self.device.type, enabled=self.autocast
         ):
             return model.forward_multi(batch, repr_layers)
 
@@ -293,14 +312,13 @@ class ProteinEncoder:
         structure_id=None,
     ):
         """
-        Phase 1: prepare_sequences for all sequences (batched via _iter_batches).
-        Phase 2: batch-wise forward. Yields (index, embed).
-        Same flow for all models (ESM3, ESMC, etc.).
+        Prepare and encode one batch at a time: prepare_sequences -> forward -> yield.
+        Yields (index, embed). Same flow for all models (ESM3, ESMC, etc.).
         """
         n = len(proteins)
-        stored_batches = []
 
         pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
+        pbar_embed = tqdm(total=n, desc="Embedding", unit="seq")
         try:
             for batch_indices, batch_sequences in self._iter_batches(proteins):
                 prepared_batch = self.prepare_sequences(
@@ -309,16 +327,12 @@ class ProteinEncoder:
                     chain_list=chain_list,
                     structure_id=structure_id,
                 )
-                stored_batches.append((batch_indices, prepared_batch))
                 pbar_prepare.update(len(batch_indices))
-        finally:
-            pbar_prepare.close()
 
-        pbar_embed = tqdm(total=n, desc="Embedding", unit="seq")
-        try:
-            for batch_indices, prepared_batch in stored_batches:
                 batch = self._batch_to_device(prepared_batch, target_device)
-                model_output = self._encode(batch)
+                model_output = self._run_encode_with_oom_recovery(
+                    lambda: self._encode(batch)
+                )
                 try:
                     for i, embed in enumerate(model_output):
                         if average_sequence:
@@ -330,9 +344,10 @@ class ProteinEncoder:
                 finally:
                     del model_output
                     del batch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    del prepared_batch
+                    self._maybe_empty_cache()
         finally:
+            pbar_prepare.close()
             pbar_embed.close()
 
     def encode_multi_layer(
@@ -349,13 +364,14 @@ class ProteinEncoder:
         Encode proteins for multiple layers in a single forward pass per batch.
 
         Yields (index, layer, embed) so the consumer can route each layer to its
-        own writer. Preparation mirrors ``_encode_two_phase`` phase 1.
+        own writer. Prepares and encodes one batch at a time without retaining
+        all prepared tensors in memory.
         """
         target_device = self._get_primary_device()
         n = len(proteins)
-        stored_batches = []
 
         pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
+        pbar_embed = tqdm(total=n * len(repr_layers), desc="Embedding", unit="emb")
         try:
             for batch_indices, batch_sequences in self._iter_batches(proteins):
                 prepared_batch = self.prepare_sequences(
@@ -364,16 +380,12 @@ class ProteinEncoder:
                     chain_list=chain_list,
                     structure_id=structure_id,
                 )
-                stored_batches.append((batch_indices, prepared_batch))
                 pbar_prepare.update(len(batch_indices))
-        finally:
-            pbar_prepare.close()
 
-        pbar_embed = tqdm(total=n * len(repr_layers), desc="Embedding", unit="emb")
-        try:
-            for batch_indices, prepared_batch in stored_batches:
                 batch = self._batch_to_device(prepared_batch, target_device)
-                model_output = self._encode_multi(batch, repr_layers)
+                model_output = self._run_encode_with_oom_recovery(
+                    lambda: self._encode_multi(batch, repr_layers)
+                )
                 try:
                     for i, layer, embed in model_output:
                         if average_sequence:
@@ -385,9 +397,10 @@ class ProteinEncoder:
                 finally:
                     del model_output
                     del batch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    del prepared_batch
+                    self._maybe_empty_cache()
         finally:
+            pbar_prepare.close()
             pbar_embed.close()
 
     def encode(
