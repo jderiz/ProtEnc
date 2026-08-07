@@ -33,41 +33,47 @@ proteins = [
   'KALTARQQEVFDLIRDHISQTGMPPTRAEIAQRLGFRSPNAAEEHLKALARKGVIEIVSGASRGIRLLQEE'
 ]
 
-for embed in encoder(proteins, return_format='numpy'):
-  # Embeddings have shape [L, D] where L is the sequence length and D the  embedding dimensionality.
-  print(embed.shape)
-  
-  # Derive a single per-protein embedding vector by averaging along the sequence dimension
-  embed.mean(0)
+# encoder(list) yields (index, embedding) tuples for streamed write-by-index
+for idx, embed in encoder(proteins, return_format='numpy'):
+  print(idx, embed.shape)
+
+# encoder(dict) yields (key, embedding) tuples
+proteins_by_id = {'seq1': proteins[0], 'seq2': proteins[1]}
+for key, embed in encoder(proteins_by_id, return_format='numpy'):
+  print(key, embed.shape)
 ```
+
+By default, `average_sequence=True` pools per-residue embeddings to a single vector per sequence (mean over the sequence dimension). Pass `average_sequence=False` to keep shape `[L, D]` where `L` is sequence length and `D` is embedding dimensionality.
+
+Multi-layer extraction is available via `encoder.encode_multi_layer(proteins, repr_layers=[6, 12, 24])`, which yields `(index, layer, embedding)` tuples. Pass `repr_layers` to `get_encoder` to configure the default layer set on the loaded model.
 
 ### Command-line interface
 
 After installation, use the `protenc` shell command for bulk generation and export of protein embeddings.
 
 ```bash
-python -m protenc.tools.extract --help
-```
-run example:
-- one worker per GPU
-- batch size 128
-- 4 workers
-- use data parallel
-- subsitute amino acid wildcards by possible substitutes
-- lmdb_writer.flush_after 1000
-- lmdb_writer.map_size 100 GiB
-
-```bash
-python -m protenc.tools.extract sequences.fasta  embeddings.lmdb --model_name esm2_t33_650M_UR50D --data_parallel --batch_size 128  --num_workers 4 --substitute_wildcards
-```
-
-By default, input and output formats are inferred from the file extensions.
-Run
-```bash
 protenc --help
 ```
 
-for a detailed usage description.
+Run example:
+- batch size 128
+- 4 dataloader workers
+- multi-GPU via `torch.nn.DataParallel` (`--data_parallel`)
+- substitute amino acid wildcards by possible substitutes
+
+```bash
+protenc sequences.fasta embeddings.lmdb --model_name esm2_t33_650M_UR50D --data_parallel --batch_size 128 --num_workers 4 --substitute_wildcards
+```
+
+Unlike the Python API, the CLI does not pool embeddings by default. Pass `--compute_mean` (alias `--pool`) to average per-residue outputs along the sequence axis.
+
+Extract representations from multiple transformer layers in one forward pass with `--repr_layers` (writes one output file per layer with a `_layer<N>` suffix):
+
+```bash
+protenc sequences.fasta embeddings.lmdb --model_name esm2_t33_650M_UR50D --repr_layers 12 24 33
+```
+
+By default, input and output formats are inferred from the file extensions.
 
 **Example**
 
@@ -124,12 +130,12 @@ Input formats:
 * JSON
 * [FASTA](https://en.wikipedia.org/wiki/FASTA_format)
 
-Output format:
+Output formats:
 * [LMDB](https://en.wikipedia.org/wiki/Lightning_Memory-Mapped_Database)
-* [HDF5](https://en.wikipedia.org/wiki/Hierarchical_Data_Format) (coming soon)
+* [HDF5](https://en.wikipedia.org/wiki/Hierarchical_Data_Format)
 
 General:
-* Multi-GPU inference with (`--data_parallel`)
+* Multi-GPU inference via `torch.nn.DataParallel` (`--data_parallel`; ESMC models fall back to a single GPU)
 * FP16 inference (`--amp`)
 
 Development
@@ -162,9 +168,8 @@ Todo
   - [X] JSON
 - [ ] Support for more output formats
   - [X] LMDB
-  - [ ] HDF5
+  - [X] HDF5
   - [ ] DataFrame
-  - [ ] Pickle
 - [ ] Support for large models
   - [ ] Model offloading
   - [ ] Sharding
