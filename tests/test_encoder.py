@@ -27,22 +27,31 @@ def test_encode(proteins, model_name, device):
     model_info = get_model_info(model_name)
     encoder = get_encoder(model_name, device=device)
 
-    for prot, embed in zip(proteins, encoder(proteins)):
-        assert len(prot) == len(embed)
+    for idx, embed in encoder(proteins):
+        assert len(proteins[idx]) == len(embed)
         assert embed.shape[-1] == model_info['embed_dim']
 
 
-@skip_no_gpu
-@skip_large_models(max_embed_dim=1280)
-@pytest.mark.parametrize('model_name', list_models_to_test())
-@pytest.mark.parametrize('device', ['cpu', 'cuda'])
-def test_encode_dict(protein_dict, model_name, device):
-    model_info = get_model_info(model_name)
-    encoder = get_encoder(model_name, device=device)
+def test_encode_list_yields_index_embed_tuples():
+    """List encode yields (index, embedding) pairs without loading a model or GPU."""
+    from unittest.mock import MagicMock
 
-    for prot_id, embed in encoder(protein_dict):
-        assert len(protein_dict[prot_id]) == len(embed)
-        assert embed.shape[-1] == model_info['embed_dim']
+    from protenc.encoder import ProteinEncoder
+
+    proteins = ['ACDE', 'FGHI', 'KLMN']
+    mock_embeds = [torch.randn(4, 8), torch.randn(4, 8), torch.randn(4, 8)]
+
+    def fake_encode_batches(*_args, **_kwargs):
+        for i, emb in enumerate(mock_embeds):
+            yield i, emb
+
+    encoder = ProteinEncoder(MagicMock())
+    encoder._encode_batches = fake_encode_batches
+
+    for idx, embed in encoder(proteins):
+        assert isinstance(idx, int)
+        assert 0 <= idx < len(proteins)
+        assert torch.equal(embed, mock_embeds[idx])
 
 
 @skip_no_gpu

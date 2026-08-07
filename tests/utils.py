@@ -1,4 +1,5 @@
 from functools import wraps
+import inspect
 import torch
 import pytest
 import warnings
@@ -7,9 +8,13 @@ from protenc.models import get_model_info, list_models
 
 
 def skip_no_gpu(fn):
+    sig = inspect.signature(fn)
+
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        device = kwargs.get('device', 'cpu')
+        bound = sig.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        device = bound.arguments.get('device', 'cpu')
 
         if device == 'cuda' and not torch.cuda.is_available():
             pytest.skip('No GPU available')
@@ -21,13 +26,17 @@ def skip_no_gpu(fn):
 
 def skip_large_models(max_embed_dim=None):
     def wrap(fn):
+        sig = inspect.signature(fn)
+
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            model_name = kwargs.get('model_name')
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            model_name = bound.arguments.get('model_name')
 
-            if model_name is None:
+            if model_name is not None:
                 model_info = get_model_info(model_name)
-                if model_info['embed_dim'] > max_embed_dim:
+                if max_embed_dim is not None and model_info['embed_dim'] > max_embed_dim:
                     pytest.skip(f'Model too large ({model_info["embed_dim"]} > {max_embed_dim} embed dimensions)')
             else:
                 warnings.warn('Test decorated with @skip_large_model but no model_name argument found. '
