@@ -36,7 +36,7 @@ def get_input_reader_cls(args):
 
 def get_output_reader_cls(args):
     output_path = Path(args.output_path)
-    infer = args.input_format in [None, "infer"]
+    infer = args.output_format in [None, "infer"]
 
     if infer:
         output_format = output_path.suffix[1:]
@@ -47,7 +47,7 @@ def get_output_reader_cls(args):
 
     if cls is None:
         raise ValueError(
-            f"Unknown input format '{output_format}'" + " (inferred)" if infer else ""
+            f"Unknown output format '{output_format}'" + " (inferred)" if infer else ""
         )
 
     return cls
@@ -238,7 +238,7 @@ def entrypoint():
     parser.add_argument(
         "--output_format",
         default="infer",
-        choices=["infer", "parquet", "pickle", "lmdb"],
+        choices=["infer", "lmdb", "hdf5"],
         help=f"Data format of output. Supported formats are {list(io.output_format_mapping)}. "
         f"Will be inferred from output path by default.",
     )
@@ -346,6 +346,9 @@ def entrypoint():
     args.output_writer_cls.add_arguments_to_parser(parser)
 
     parser.parse_args(namespace=args)
+
+    if args.no_gpu:
+        args.device = "cpu"
 
     logging.basicConfig(
         log_colors={
