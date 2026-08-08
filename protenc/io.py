@@ -66,7 +66,7 @@ class BaseOutputWriter:
 
 
 class CSVReader(BaseInputReader):
-    def __init__(self, path, delimiter=",", label_col="label", sequence_col="protein"):
+    def __init__(self, path, delimiter=",", label_col="index", sequence_col="sequence"):
         self.path = Path(path)
 
         self.delimiter = delimiter

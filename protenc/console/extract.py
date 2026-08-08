@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import textwrap
+import warnings
 import torch
 import torch.nn as nn
 import protenc
@@ -11,6 +12,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from protenc import io as io, utils
+from protenc.esmc_loading import is_esmc_model
 from protenc.models import EmbeddingType
 import colorlog as logging
 
@@ -36,7 +38,7 @@ def get_input_reader_cls(args):
 
 def get_output_reader_cls(args):
     output_path = Path(args.output_path)
-    infer = args.input_format in [None, "infer"]
+    infer = args.output_format in [None, "infer"]
 
     if infer:
         output_format = output_path.suffix[1:]
@@ -47,7 +49,7 @@ def get_output_reader_cls(args):
 
     if cls is None:
         raise ValueError(
-            f"Unknown input format '{output_format}'" + " (inferred)" if infer else ""
+            f"Unknown output format '{output_format}'" + " (inferred)" if infer else ""
         )
 
     return cls
@@ -76,6 +78,31 @@ def _postprocess_embedding(args, model, embedding):
         embedding = embedding.astype(args.cast_to)
 
     return embedding
+
+
+def _maybe_apply_data_parallel(model, data_parallel, device_ids):
+    """Wrap model with nn.DataParallel when requested.
+
+    Multi-GPU support uses torch.nn.DataParallel only; DistributedDataParallel (DDP) is not supported.
+    """
+    if not data_parallel:
+        return
+
+    is_esmc_model_flag = False
+    if hasattr(model, "model"):
+        if is_esmc_model(model.model):
+            is_esmc_model_flag = True
+    elif is_esmc_model(model):
+        is_esmc_model_flag = True
+
+    if is_esmc_model_flag:
+        warnings.warn(
+            "DataParallel is not supported for ESMC models due to ESMCOutput compatibility issues. "
+            "Falling back to single GPU for ESMC models."
+        )
+        return
+
+    model.model = nn.DataParallel(model.model, device_ids=device_ids or None)
 
 
 def _build_batches(args, model):
@@ -124,10 +151,7 @@ def main(args):
     batches = _build_batches(args, model)
 
     if "cuda" in args.device:
-        if args.data_parallel:
-            model.model = nn.DataParallel(
-                model.model, device_ids=args.device_ids or None
-            )
+        _maybe_apply_data_parallel(model, args.data_parallel, args.device_ids)
 
     model = model.to(args.device)
 
@@ -171,10 +195,7 @@ def main_multi_layer(args, repr_layers):
     batches = _build_batches(args, model)
 
     if "cuda" in args.device:
-        if args.data_parallel:
-            model.model = nn.DataParallel(
-                model.model, device_ids=args.device_ids or None
-            )
+        _maybe_apply_data_parallel(model, args.data_parallel, args.device_ids)
 
     model = model.to(args.device)
 
@@ -238,7 +259,7 @@ def entrypoint():
     parser.add_argument(
         "--output_format",
         default="infer",
-        choices=["infer", "parquet", "pickle", "lmdb"],
+        choices=["infer", "lmdb", "hdf5"],
         help=f"Data format of output. Supported formats are {list(io.output_format_mapping)}. "
         f"Will be inferred from output path by default.",
     )
@@ -346,6 +367,9 @@ def entrypoint():
     args.output_writer_cls.add_arguments_to_parser(parser)
 
     parser.parse_args(namespace=args)
+
+    if args.no_gpu:
+        args.device = "cpu"
 
     logging.basicConfig(
         log_colors={
