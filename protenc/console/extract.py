@@ -1,19 +1,18 @@
 import argparse
 import contextlib
 import textwrap
-import warnings
-import torch
-import torch.nn as nn
-import protenc
 import os
 import lmdb
 from functools import partial
 from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+import numpy as np
+import protenc
 from protenc import io as io, utils
-from protenc.esmc_loading import is_esmc_model
-from protenc.models import EmbeddingType
+from protenc.encoder import get_encoder
+from protenc.models import layer_output_path
 import colorlog as logging
 
 
@@ -55,24 +54,38 @@ def get_output_reader_cls(args):
     return cls
 
 
-def collate_fn(samples, max_len=None, transform_fn=None):
+def collate_fn(samples, max_len=None, substitute_wildcards=False):
     labels, sequences = zip(*samples)
 
     if max_len:
         sequences = [s[:max_len] for s in sequences]
 
-    if transform_fn is not None:
-        sequences = transform_fn(sequences)
+    if substitute_wildcards:
+        sequences = [utils.sub_nucleotide_wildcards(s) for s in sequences]
 
-    return labels, sequences
+    return labels, list(sequences)
 
 
-def _postprocess_embedding(args, model, embedding):
-    embedding = embedding.cpu().numpy()
+def _create_encoder(args, repr_layers=None):
+    """Build a ProteinEncoder from CLI arguments (shared with Python API path)."""
+    data_parallel = args.data_parallel and "cuda" in args.device
+    return get_encoder(
+        args.model_name,
+        device=args.device,
+        repr_layer=args.repr_layer,
+        repr_layers=repr_layers,
+        batch_size=args.batch_size,
+        autocast=args.amp,
+        preprocess_workers=args.num_workers,
+        data_parallel=data_parallel,
+        device_ids=args.device_ids,
+    )
 
-    if args.compute_mean and model.embedding_kind == EmbeddingType.PER_RESIDUE:
-        assert embedding.ndim == 2
-        embedding = embedding.mean(0)
+
+def _postprocess_embedding(args, embedding):
+    """CLI-only postprocessing after encoder output (dtype cast)."""
+    if not isinstance(embedding, np.ndarray):
+        embedding = np.asarray(embedding)
 
     if args.cast_to:
         embedding = embedding.astype(args.cast_to)
@@ -80,32 +93,7 @@ def _postprocess_embedding(args, model, embedding):
     return embedding
 
 
-def _maybe_apply_data_parallel(model, data_parallel, device_ids):
-    """Wrap model with nn.DataParallel when requested.
-
-    Multi-GPU support uses torch.nn.DataParallel only; DistributedDataParallel (DDP) is not supported.
-    """
-    if not data_parallel:
-        return
-
-    is_esmc_model_flag = False
-    if hasattr(model, "model"):
-        if is_esmc_model(model.model):
-            is_esmc_model_flag = True
-    elif is_esmc_model(model):
-        is_esmc_model_flag = True
-
-    if is_esmc_model_flag:
-        warnings.warn(
-            "DataParallel is not supported for ESMC models due to ESMCOutput compatibility issues. "
-            "Falling back to single GPU for ESMC models."
-        )
-        return
-
-    model.model = nn.DataParallel(model.model, device_ids=device_ids or None)
-
-
-def _build_batches(args, model):
+def _build_batches(args):
     input_reader = args.input_reader_cls.from_args(args.input_path, args)
 
     if os.path.exists(args.output_path) and args.overwrite is False:
@@ -120,90 +108,65 @@ def _build_batches(args, model):
             logger.debug(f"Keys: {keys}")
             input_reader = io.FilteredInputReader(input_reader, keys)
 
-    transform_fn = model.prepare_sequences
-
-    if args.substitute_wildcards:
-        transform_fn = lambda seqs: transform_fn(  # noqa: E731
-            [utils.sub_nucleotide_wildcards(s) for s in seqs]
-        )
-
     return DataLoader(
         utils.IteratorWrapper(input_reader),
         batch_size=args.batch_size,
         collate_fn=partial(
-            collate_fn, max_len=args.max_prot_len, transform_fn=transform_fn
+            collate_fn,
+            max_len=args.max_prot_len,
+            substitute_wildcards=args.substitute_wildcards,
         ),
         num_workers=args.num_workers,
     )
 
 
-@torch.no_grad()
 def main(args):
     repr_layers = getattr(args, "repr_layers", None)
     if repr_layers and len(repr_layers) > 1:
         return main_multi_layer(args, repr_layers)
 
-    model = protenc.get_model(args.model_name, repr_layer=args.repr_layer)
-    model.eval()
+    encoder = _create_encoder(args)
 
     logger.info(f"Reading data from {args.input_path}")
-
-    batches = _build_batches(args, model)
-
-    if "cuda" in args.device:
-        _maybe_apply_data_parallel(model, args.data_parallel, args.device_ids)
-
-    model = model.to(args.device)
+    batches = _build_batches(args)
 
     print(f"Starting inference loop; writing to {args.output_path}")
 
     with (
-        torch.amp.autocast(args.device, enabled=args.amp),
         args.output_writer_cls.from_args(args.output_path, args) as writer,
         tqdm() as pbar,
     ):
         for labels, sequences in batches:
-            sequences = utils.to_device(sequences, args.device)
-            output = model(sequences)
-
-            for label, embedding in zip(labels, output):
-                embedding = _postprocess_embedding(args, model, embedding)
+            for batch_idx, embedding in encoder.encode_sequences_batch(
+                sequences,
+                average_sequence=args.compute_mean,
+                return_format="numpy",
+                show_progress=False,
+            ):
+                embedding = _postprocess_embedding(args, embedding)
 
                 if not args.dry_run:
-                    # TODO: having the put call on the same thread/process as the GPU calls probably results in stalls.
-                    #   This may be improved by setting lmdb.open(...) options appropriately or moving the storing
-                    #   procedure into its own thread or process.
-                    writer(label, embedding)
+                    writer(labels[batch_idx], embedding)
 
             pbar.update(len(labels))
 
 
-@torch.no_grad()
 def main_multi_layer(args, repr_layers):
     """Extract multiple layers in a single forward pass, one output file per layer."""
-    from protenc.models import layer_output_path
-
-    model = protenc.get_model(
-        args.model_name, repr_layer=args.repr_layer, repr_layers=repr_layers
-    )
-    model.eval()
-    layers = model.repr_layers or sorted(set(repr_layers))
+    encoder = _create_encoder(args, repr_layers=repr_layers)
+    layers = encoder.repr_layers or sorted(set(repr_layers))
 
     logger.info(f"Reading data from {args.input_path}")
     logger.info(f"Extracting layers {layers} in a single forward pass.")
 
-    batches = _build_batches(args, model)
+    batches = _build_batches(args)
 
-    if "cuda" in args.device:
-        _maybe_apply_data_parallel(model, args.data_parallel, args.device_ids)
-
-    model = model.to(args.device)
-
-    layer_paths = {layer: str(layer_output_path(args.output_path, layer)) for layer in layers}
+    layer_paths = {
+        layer: str(layer_output_path(args.output_path, layer)) for layer in layers
+    }
     print(f"Starting inference loop; writing layers to {list(layer_paths.values())}")
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(torch.amp.autocast(args.device, enabled=args.amp))
         pbar = stack.enter_context(tqdm())
         writers = {
             layer: stack.enter_context(
@@ -213,11 +176,14 @@ def main_multi_layer(args, repr_layers):
         }
 
         for labels, sequences in batches:
-            sequences = utils.to_device(sequences, args.device)
-            output = model.forward_multi(sequences, layers)
-
-            for batch_idx, layer, embedding in output:
-                embedding = _postprocess_embedding(args, model, embedding)
+            for batch_idx, layer, embedding in encoder.encode_multi_layer(
+                sequences,
+                layers,
+                average_sequence=args.compute_mean,
+                return_format="numpy",
+                show_progress=False,
+            ):
+                embedding = _postprocess_embedding(args, embedding)
 
                 if not args.dry_run:
                     writers[layer](labels[batch_idx], embedding)

@@ -5,9 +5,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from protenc.console.extract import _maybe_apply_data_parallel
+from protenc.console.extract import _create_encoder
 from protenc.encoder import ProteinEncoder, get_encoder
 from protenc.models import get_model
+from protenc.utils import NestedNamespace
 from tests.utils import skip_no_gpu
 
 
@@ -29,18 +30,29 @@ def test_esmc_data_parallel_disabled_on_get_encoder():
     )
 
 
-def test_esmc_data_parallel_disabled_in_extract():
-    """extract.py should skip DataParallel for ESMC models."""
-    model = get_model("prot_bert")
-    inner = model.model
+def test_esmc_data_parallel_disabled_via_cli_encoder_factory():
+    """CLI _create_encoder should skip DataParallel for ESMC models."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
 
-    with patch("protenc.console.extract.is_esmc_model", return_value=True):
+    args = NestedNamespace(
+        model_name="prot_bert",
+        repr_layer=None,
+        device="cuda",
+        data_parallel=True,
+        device_ids=None,
+        batch_size=64,
+        amp=False,
+        num_workers=0,
+    )
+
+    with patch("protenc.encoder.is_esmc_model", return_value=True):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            _maybe_apply_data_parallel(model, data_parallel=True, device_ids=None)
+            encoder = _create_encoder(args)
 
-    assert model.model is inner
-    assert not isinstance(model.model, nn.DataParallel)
+    assert encoder.data_parallel is False
+    assert not isinstance(encoder.model.model, nn.DataParallel)
     assert any(
         "DataParallel is not supported for ESMC models" in str(w.message)
         for w in caught

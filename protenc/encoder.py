@@ -6,7 +6,7 @@ from functools import cached_property
 from tqdm import tqdm
 from protenc.types import BatchSize, ProteinEncoderInput, ReturnFormat
 from torch.utils.data import DataLoader
-from protenc.models import BaseProteinEmbeddingModel, get_model
+from protenc.models import BaseProteinEmbeddingModel, EmbeddingType, get_model
 from protenc.esmc_loading import is_esmc_model
 
 
@@ -248,6 +248,20 @@ class ProteinEncoder:
             self._maybe_empty_cache(force=True)
             return encode_fn()
 
+    def _underlying_model(self) -> BaseProteinEmbeddingModel:
+        model = self.model
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        return model
+
+    def _maybe_pool_embedding(self, embed: torch.Tensor, average_sequence: bool) -> torch.Tensor:
+        if not average_sequence:
+            return embed
+        if self._underlying_model().embedding_kind == EmbeddingType.PER_RESIDUE:
+            if embed.ndim >= 2:
+                return embed.mean(0)
+        return embed
+
     def _encode(self, batch):
         """Process a batch through the model and return embeddings."""
         with torch.inference_mode(), torch.amp.autocast(
@@ -274,6 +288,7 @@ class ProteinEncoder:
         return_format: ReturnFormat = "torch",
         chain_list=None,
         structure_id=None,
+        show_progress: bool = True,
     ):
         """
         Flow for all models: 1) prepare_sequences (tokenization), 2) batch-wise forward.
@@ -288,6 +303,33 @@ class ProteinEncoder:
             target_device,
             chain_list=chain_list,
             structure_id=structure_id,
+            show_progress=show_progress,
+        )
+
+    def encode_sequences_batch(
+        self,
+        sequences: list[str],
+        average_sequence: bool = False,
+        return_format: ReturnFormat = "torch",
+        show_progress: bool = False,
+        structures=None,
+        chain_list=None,
+        structure_id=None,
+    ):
+        """
+        Encode a single batch of raw protein sequences.
+
+        Intended for bulk CLI pipelines that stream labeled batches from disk.
+        Yields ``(local_index, embedding)`` tuples without nested progress bars.
+        """
+        yield from self._encode_batches(
+            sequences,
+            structures=structures,
+            average_sequence=average_sequence,
+            return_format=return_format,
+            chain_list=chain_list,
+            structure_id=structure_id,
+            show_progress=show_progress,
         )
 
     def _batch_to_device(self, batch, target_device: torch.device):
@@ -310,6 +352,7 @@ class ProteinEncoder:
         target_device: torch.device,
         chain_list=None,
         structure_id=None,
+        show_progress: bool = True,
     ):
         """
         Prepare and encode one batch at a time: prepare_sequences -> forward -> yield.
@@ -317,8 +360,12 @@ class ProteinEncoder:
         """
         n = len(proteins)
 
-        pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
-        pbar_embed = tqdm(total=n, desc="Embedding", unit="seq")
+        pbar_prepare = tqdm(
+            total=n, desc="Preparing features", unit="seq", disable=not show_progress
+        )
+        pbar_embed = tqdm(
+            total=n, desc="Embedding", unit="seq", disable=not show_progress
+        )
         try:
             for batch_indices, batch_sequences in self._iter_batches(proteins):
                 prepared_batch = self.prepare_sequences(
@@ -335,8 +382,7 @@ class ProteinEncoder:
                 )
                 try:
                     for i, embed in enumerate(model_output):
-                        if average_sequence:
-                            embed = embed.mean(0)
+                        embed = self._maybe_pool_embedding(embed, average_sequence)
                         out = utils.to_return_format(embed.cpu(), return_format)
                         del embed
                         yield (batch_indices[i], out)
@@ -359,6 +405,7 @@ class ProteinEncoder:
         return_format: ReturnFormat = "torch",
         chain_list=None,
         structure_id=None,
+        show_progress: bool = True,
     ):
         """
         Encode proteins for multiple layers in a single forward pass per batch.
@@ -370,8 +417,15 @@ class ProteinEncoder:
         target_device = self._get_primary_device()
         n = len(proteins)
 
-        pbar_prepare = tqdm(total=n, desc="Preparing features", unit="seq")
-        pbar_embed = tqdm(total=n * len(repr_layers), desc="Embedding", unit="emb")
+        pbar_prepare = tqdm(
+            total=n, desc="Preparing features", unit="seq", disable=not show_progress
+        )
+        pbar_embed = tqdm(
+            total=n * len(repr_layers),
+            desc="Embedding",
+            unit="emb",
+            disable=not show_progress,
+        )
         try:
             for batch_indices, batch_sequences in self._iter_batches(proteins):
                 prepared_batch = self.prepare_sequences(
@@ -388,8 +442,7 @@ class ProteinEncoder:
                 )
                 try:
                     for i, layer, embed in model_output:
-                        if average_sequence:
-                            embed = embed.mean(0)
+                        embed = self._maybe_pool_embedding(embed, average_sequence)
                         out = utils.to_return_format(embed.cpu(), return_format)
                         del embed
                         yield (batch_indices[i], layer, out)
@@ -411,6 +464,7 @@ class ProteinEncoder:
         return_format: ReturnFormat = "torch",
         chain_list=None,
         structure_id=None,
+        show_progress: bool = True,
     ):
         """
         Encode proteins into embeddings.
@@ -436,6 +490,7 @@ class ProteinEncoder:
                 return_format=return_format,
                 chain_list=chain_list,
                 structure_id=structure_id,
+                show_progress=show_progress,
             )
             for _idx, emb in gen:
                 yield keys[_idx], emb
@@ -447,6 +502,7 @@ class ProteinEncoder:
                 return_format=return_format,
                 chain_list=chain_list,
                 structure_id=structure_id,
+                show_progress=show_progress,
             )
             for item in gen:
                 yield item  # (index, embed) for streamed write-by-index
@@ -505,13 +561,11 @@ class ProteinEncoder:
         # For batched output, stack the embeddings
         if len(embeds) > 1:
             stacked_embeds = torch.stack(embeds)
-            if average_sequence:
+            if average_sequence and self._underlying_model().embedding_kind == EmbeddingType.PER_RESIDUE:
                 stacked_embeds = stacked_embeds.mean(1)
             return utils.to_return_format(stacked_embeds.cpu(), return_format)
         else:
-            embed = embeds[0]
-            if average_sequence:
-                embed = embed.mean(0)
+            embed = self._maybe_pool_embedding(embeds[0], average_sequence)
             return utils.to_return_format(embed.cpu(), return_format)
 
     def __call__(self, *args, **kwargs):
