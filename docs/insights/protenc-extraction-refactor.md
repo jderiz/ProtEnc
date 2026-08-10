@@ -2,7 +2,7 @@
 
 **Origin Stamp**
 - Timestamp: 2026-08-10T17:36:51Z
-- Git Commit: `1b42505bcb3c970c5e987da7af719a227b805723` (pre-merge; see `master` after integration)
+- Git Commit: `98bd110` (`master` after CLI–encoder parity merge)
 - MLflow Run ID: none
 
 ## What changed
