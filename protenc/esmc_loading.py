@@ -42,8 +42,31 @@ def resolve_esmc_model_name(name: str) -> str:
     return name
 
 
+def _ensure_esmc_tokenizer_hub_alias() -> None:
+    """Hub configs name ``EsmcTokenizer``; Biohub transformers exports ``ESMCTokenizer``."""
+    try:
+        import transformers
+    except ImportError:
+        return
+    existing = getattr(transformers, "EsmcTokenizer", None)
+    if existing is not None and existing.__name__ == "EsmcTokenizer":
+        return
+    base = getattr(transformers, "ESMCTokenizer", None)
+    if base is None:
+        try:
+            from transformers.models.esmc.tokenization_esmc import ESMCTokenizer as base
+        except ImportError:
+            return
+
+    class EsmcTokenizer(base):  # type: ignore[valid-type,misc]
+        pass
+
+    transformers.EsmcTokenizer = EsmcTokenizer
+
+
 def load_esmc(model_name: str, *, use_flash_attn: bool = True) -> tuple[ESMC, Any]:
     """Load an ESMC model and tokenizer via ``ESMC.from_pretrained``."""
+    _ensure_esmc_tokenizer_hub_alias()
     resolved_name = resolve_esmc_model_name(model_name)
     model = ESMC.from_pretrained(resolved_name)
     model.eval()
