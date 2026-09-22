@@ -64,11 +64,101 @@ def _ensure_esmc_tokenizer_hub_alias() -> None:
     transformers.EsmcTokenizer = EsmcTokenizer
 
 
+_ESMC_LEGACY_PTH: dict[str, dict[str, Any]] = {
+    "esmc_300m": {
+        "repo": "biohub/esmc-300m-2024-12",
+        "d_model": 960,
+        "n_heads": 15,
+        "n_layers": 30,
+    },
+    "esmc_600m": {
+        "repo": "biohub/esmc-600m-2024-12",
+        "d_model": 1152,
+        "n_heads": 18,
+        "n_layers": 36,
+    },
+    "esmc_6b": {
+        "repo": "biohub/esmc-6b-2024-12",
+        "d_model": 2560,
+        "n_heads": 40,
+        "n_layers": 80,
+    },
+}
+
+
+def _load_esmc_legacy_nested_pth(
+    alias: str,
+    *,
+    use_flash_attn: bool = True,
+    device: torch.device | None = None,
+) -> ESMC:
+    """Load ESMC from ``biohub/esmc-*-2024-12`` nested ``data/weights/*.pth``.
+
+    esm 3.3 + huggingface_hub>=0.36 fails two ways on the official builders:
+    1. ``load_torch_model(snapshot_dir)`` rejects the directory (weights are nested).
+    2. Even with a ``.pth`` path, ``init_empty_weights`` + ``load_state_dict`` without
+       ``assign=True`` leaves meta tensors and ``.to(device)`` raises.
+
+    Materialize a real module, load the state dict, then move to device (bf16 on GPU).
+    """
+    from pathlib import Path
+
+    from esm.tokenization import get_esmc_model_tokenizers
+    from huggingface_hub import snapshot_download
+
+    if alias not in _ESMC_LEGACY_PTH:
+        raise KeyError(f"No legacy ESMC pth spec for {alias!r}")
+    spec = _ESMC_LEGACY_PTH[alias]
+    snap = Path(snapshot_download(repo_id=spec["repo"]))
+    pths = sorted((snap / "data" / "weights").glob("*.pth"))
+    if len(pths) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one .pth under {snap / 'data' / 'weights'}, found {pths!r}"
+        )
+
+    model = ESMC(
+        d_model=int(spec["d_model"]),
+        n_heads=int(spec["n_heads"]),
+        n_layers=int(spec["n_layers"]),
+        tokenizer=get_esmc_model_tokenizers(),
+        use_flash_attn=use_flash_attn,
+    ).eval()
+    state = torch.load(pths[0], map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    elif isinstance(state, dict) and "model" in state and "embed.weight" not in state:
+        state = state["model"]
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        raise RuntimeError(f"ESMC legacy pth load missing keys for {alias}: {missing[:8]}...")
+    if unexpected:
+        # Non-fatal for auxiliary buffers; still surface for debugging.
+        pass
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    if device.type != "cpu":
+        model = model.to(torch.bfloat16)
+    return model
+
+
 def load_esmc(model_name: str, *, use_flash_attn: bool = True) -> tuple[ESMC, Any]:
     """Load an ESMC model and tokenizer via ``ESMC.from_pretrained``."""
     _ensure_esmc_tokenizer_hub_alias()
     resolved_name = resolve_esmc_model_name(model_name)
-    model = ESMC.from_pretrained(resolved_name)
+    try:
+        try:
+            model = ESMC.from_pretrained(resolved_name, use_flash_attn=use_flash_attn)
+        except TypeError:
+            # Older ESMC.from_pretrained signatures omit use_flash_attn.
+            model = ESMC.from_pretrained(resolved_name)
+    except (ValueError, NotImplementedError):
+        if resolved_name not in _ESMC_LEGACY_PTH:
+            raise
+        model = _load_esmc_legacy_nested_pth(
+            resolved_name, use_flash_attn=use_flash_attn
+        )
     model.eval()
     return model, model.tokenizer
 
