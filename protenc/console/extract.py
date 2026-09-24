@@ -1,19 +1,21 @@
 import argparse
 import contextlib
-import textwrap
 import os
-import lmdb
+import textwrap
 from functools import partial
 from pathlib import Path
+
+import colorlog as logging
+import lmdb
+import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-import numpy as np
 import protenc
-from protenc import io as io, utils
+from protenc import io as io
+from protenc import utils
 from protenc.encoder import get_encoder
 from protenc.models import layer_output_path
-import colorlog as logging
 
 
 def get_input_reader_cls(args):
@@ -169,9 +171,7 @@ def main_multi_layer(args, repr_layers):
     with contextlib.ExitStack() as stack:
         pbar = stack.enter_context(tqdm())
         writers = {
-            layer: stack.enter_context(
-                args.output_writer_cls.from_args(path, args)
-            )
+            layer: stack.enter_context(args.output_writer_cls.from_args(path, args))
             for layer, path in layer_paths.items()
         }
 

@@ -3,12 +3,12 @@ import hashlib
 import pickle
 import random
 import re
-import numpy as np
-import lmdb
-import torch
-
-from itertools import chain
 from collections.abc import Mapping
+from itertools import chain
+
+import lmdb
+import numpy as np
+import torch
 from humanfriendly import parse_size
 
 # See https://www.drive5.com/usearch/manual/IUPAC_codes.html

@@ -1,20 +1,22 @@
 import argparse
 import json
 import pickle
-import numpy as np
-import lmdb
-import os
-import h5py
-
-from Bio import SeqIO
+from abc import ABC, abstractmethod
 from csv import DictReader
 from pathlib import Path
-from abc import ABC, abstractmethod
-from typing import Callable
-from protenc.utils import HumanFriendlyParsingAction
+from typing import Any, Callable, Iterator
+
 import colorlog as logging
+import h5py
+import lmdb
+import numpy as np
+from Bio import SeqIO
+
+from protenc.utils import HumanFriendlyParsingAction
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
+
 
 class BaseInputReader(ABC):
     @staticmethod
@@ -23,12 +25,13 @@ class BaseInputReader(ABC):
 
     @classmethod
     @abstractmethod
-    def from_args(cls, path, args):
+    def from_args(cls, path, args) -> "BaseInputReader | None":
         pass
 
     @abstractmethod
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple[str, str]]:
         pass
+
 
 class FilteredInputReader(BaseInputReader):
     def __init__(self, reader: BaseInputReader, filter_keys):
@@ -36,16 +39,17 @@ class FilteredInputReader(BaseInputReader):
         self.filter_keys = filter_keys
 
     @classmethod
-    def from_args(cls, path, args):
+    def from_args(cls, path, args) -> None:
         pass
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple[str, str]]:
         for label, sequence in self.reader:
             if label not in self.filter_keys:
                 yield label, sequence
 
     def get_filtered_keys(self):
         return self.filter_keys
+
 
 class BaseOutputWriter:
     @staticmethod
@@ -54,7 +58,7 @@ class BaseOutputWriter:
 
     @classmethod
     @abstractmethod
-    def from_args(cls, path, args):
+    def from_args(cls, path, args) -> "BaseOutputWriter":
         pass
 
     @abstractmethod
@@ -122,7 +126,7 @@ class JSONReader(BaseInputReader):
                     "json_stream needs to be installed for streaming json input."
                 )
 
-            json_load = json_stream.load
+            json_load: Callable[..., Any] = json_stream.load
         else:
             json_load = json.load
 
@@ -148,14 +152,12 @@ class FASTAReader(BaseInputReader):
                 yield label, sequence
 
 
-
-
 class LMDBWriter(BaseOutputWriter):
     def __init__(self, path, **lmdb_kwargs):
         self.path = path
-        self.flush_after = lmdb_kwargs.pop("flush_after", 5000) 
+        self.flush_after = lmdb_kwargs.pop("flush_after", 5000)
         self.lmdb_kwargs = lmdb_kwargs
-        self.ctx = None
+        self.ctx: tuple[Any, Any] | None = None
         self.counter = 0
 
     @staticmethod
@@ -212,6 +214,7 @@ class LMDBWriter(BaseOutputWriter):
         return self._callback
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        assert self.ctx is not None
         env, txn = self.ctx
         txn.commit()
         env.close()
@@ -251,13 +254,13 @@ class HDF5Writer(BaseOutputWriter):
                 data=embedding,
                 compression=self.hdf5_kwargs.get("compression", "gzip"),
                 compression_opts=self.hdf5_kwargs.get("compression_opts", 9),
-                chunks=self.hdf5_kwargs.get("chunks", True)
+                chunks=self.hdf5_kwargs.get("chunks", True),
             )
             self.counter += 1
-            
+
             if self.counter % 1000 == 0:
                 logger.info(f"Saved {self.counter} embeddings to HDF5")
-                
+
         except Exception as e:
             logger.error(f"Error saving embedding {label}: {e}")
             raise
@@ -266,7 +269,7 @@ class HDF5Writer(BaseOutputWriter):
         if self.file is None:
             logger.debug(f"Opening HDF5 file: {self.path}")
             try:
-                self.file = h5py.File(str(self.path), 'w')
+                self.file = h5py.File(str(self.path), "w")
             except Exception as e:
                 msg = f"Could not create HDF5 file {self.path}: {e}"
                 logger.error(msg)

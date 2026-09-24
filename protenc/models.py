@@ -1,26 +1,31 @@
-from dataclasses import dataclass
 import contextlib
 import os
+import re
 import warnings
+from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable, List, Optional
+
+import colorlog as logging
 import torch
 import torch.nn as nn
-from collections import OrderedDict
-from typing import Callable, List, Optional
-from enum import Enum
+from esm.models.esm3 import ESM3
+from esm.models.esmc import ESMC
+from esm.sdk.api import ESMProtein, ProteinComplex
+from esm.utils.structure.protein_chain import ProteinChain
+from sequence_models.pretrained import load_model_and_alphabet
 from transformers import (
+    AutoTokenizer,
     BertModel,
     BertTokenizer,
+    EsmModel,
     T5EncoderModel,
     T5Tokenizer,
-    EsmModel,
-    AutoTokenizer,
 )
-from sequence_models.pretrained import load_model_and_alphabet
-import colorlog as logging
-import re
+
 from protenc.esmc_loading import (
     ESMC_HF_REPOS,
-    esmc_hidden_at_layer,
     esmc_hidden_states,
     esmc_num_layers,
     esmc_select_hidden_layer,
@@ -28,14 +33,16 @@ from protenc.esmc_loading import (
     load_esmc,
     tokenize_esmc_sequences,
 )
-from esm.models.esm3 import ESM3
-from esm.sdk.api import ESMProtein, ProteinComplex
-from esm.utils.structure.protein_chain import ProteinChain
 
 try:
-    from .mpnn import ProteinMPNN, parse_PDB, tied_featurize, gather_nodes
+    from .mpnn import ProteinMPNN, gather_nodes, parse_PDB, tied_featurize
 except ImportError:
-    from mpnn import ProteinMPNN, parse_PDB, tied_featurize, gather_nodes
+    from mpnn import (  # pyright: ignore[reportMissingImports]
+        ProteinMPNN,
+        gather_nodes,
+        parse_PDB,
+        tied_featurize,
+    )
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -98,8 +105,10 @@ def layer_output_path(path, layer: int):
 
     p = Path(path)
     new_name = f"{p.stem}_layer{layer}{p.suffix}"
-    return type(path)(p.with_name(new_name)) if isinstance(path, str) else p.with_name(
-        new_name
+    return (
+        type(path)(p.with_name(new_name))
+        if isinstance(path, str)
+        else p.with_name(new_name)
     )
 
 
@@ -124,6 +133,7 @@ def _esmc_num_layers_from_name(name: str) -> int:
         f"Expected one of {sorted(_ESMC_NUM_LAYERS)}."
     )
 
+
 def _hf_hidden_at_layer(hidden_states: tuple, repr_layer: int) -> torch.Tensor:
     return hidden_states[repr_layer]
 
@@ -132,9 +142,26 @@ def _esm3_hidden_at_layer(hidden_states: tuple, repr_layer: int) -> torch.Tensor
     return hidden_states[repr_layer - 1]
 
 
-def _assert_esmc_num_layers(
-    model: nn.Module, expected: int, *, model_name: str
-) -> None:
+def _hf_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
+    hidden_states = backbone(**inputs, output_hidden_states=True).hidden_states
+    return torch.stack(
+        [_hf_hidden_at_layer(hidden_states, layer) for layer in layers], dim=1
+    )
+
+
+def _esmc_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
+    hidden_states = esmc_hidden_states(backbone, inputs)  # [n_layers + 1, B, L, D]
+    return torch.stack(
+        [esmc_select_hidden_layer(hidden_states, layer) for layer in layers], dim=1
+    )
+
+
+def _carp_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
+    results = backbone(inputs["tokens"], repr_layers=list(layers), logits=False)
+    return torch.stack([results["representations"][layer] for layer in layers], dim=1)
+
+
+def _assert_esmc_num_layers(model: ESMC, expected: int, *, model_name: str) -> None:
     actual = esmc_num_layers(model)
     if actual != expected:
         warnings.warn(
@@ -152,9 +179,7 @@ def _assert_hf_num_hidden_layers(
 ) -> None:
     actual = hf_config_num_layers(model.config)
     if actual is None:
-        raise ValueError(
-            f"Could not read layer count from config for '{model_name}'."
-        )
+        raise ValueError(f"Could not read layer count from config for '{model_name}'.")
     if actual != expected:
         warnings.warn(
             f"Layer count mismatch for '{model_name}': "
@@ -171,18 +196,75 @@ class EmbeddingType(Enum):
     PER_PROTEIN = "per_protein"
 
 
+class _HiddenCore(nn.Module):
+    """
+    DataParallel-safe compute core of an embedder.
+
+    ``forward(inputs, layers)`` returns a batch-first tensor ``[B, len(layers), L, D]``
+    so ``nn.DataParallel`` can scatter ``inputs`` and gather the output along dim 0.
+    ``fn`` must only use the ``backbone`` it is given (each replica passes its own copy),
+    and ``static`` must hold plain values shared across replicas.
+    """
+
+    def __init__(self, backbone: nn.Module, fn: Callable[..., torch.Tensor], **static):
+        super().__init__()
+        self.backbone = backbone
+        self.fn = fn
+        self.static = static
+
+    @torch.no_grad()
+    def forward(self, inputs: dict, layers: tuple[int, ...]) -> torch.Tensor:
+        return self.fn(self.backbone, inputs, layers, **self.static)
+
+
 class BaseProteinEmbeddingModel(nn.Module):
     embedding_type: EmbeddingType
     # Default: no explicit chain break token. Specific models may override.
     chain_break_token: str = ""
     # Layers to extract in the multi-layer path; set by get_model when configured.
     repr_layers: list[int] | None = None
+    # Implemented by subclasses that support multi-layer extraction (type-only
+    # declaration; no runtime attribute is created here).
+    forward_multi: Callable[..., Any]
 
-    def prepare_sequences(self, sequences, structures=None):
+    def prepare_sequences(self, sequences, structures=None) -> Any:
         return NotImplementedError
 
     def forward(self, input):
         raise NotImplementedError
+
+    def _set_core(self, fn: Callable[..., torch.Tensor], **static) -> None:
+        """Build the compute core around ``self.model``.
+
+        The core is stored outside ``_modules`` so the backbone is not registered twice
+        (no duplicate ``state_dict`` keys); it shares the backbone with ``self.model``,
+        so ``.to()``/``.eval()`` on the embedder still apply to it.
+        """
+        object.__setattr__(self, "_core", _HiddenCore(self.model, fn, **static))
+
+    def enable_data_parallel(self, device_ids: list[int] | None = None) -> None:
+        """Replicate the compute core across GPUs with ``nn.DataParallel``."""
+        if isinstance(self._core, nn.DataParallel):
+            return
+        object.__setattr__(
+            self, "_core", nn.DataParallel(self._core, device_ids=device_ids)
+        )
+
+    @property
+    def is_data_parallel(self) -> bool:
+        return isinstance(getattr(self, "_core", None), nn.DataParallel)
+
+    def _run_core(self, input, layers) -> torch.Tensor:
+        """Run the compute core on a prepared batch; returns ``[B, len(layers), L, D]``."""
+        if isinstance(input, torch.Tensor):
+            input = {"input_ids": input}
+        # Plain dict (not BatchEncoding/UserDict) so DataParallel scatters its tensors.
+        device = next(self.model.parameters()).device
+        inputs = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in dict(input).items()
+        }
+        return self._core(inputs, tuple(layers))
 
 
 def load_huggingface_language_model(
@@ -221,6 +303,7 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         validate_repr_layer(
             self.repr_layer, num_layers, model_name=model_name or type(self).__name__
         )
+        self._set_core(_hf_core)
 
     def _validate_model_name(self, model_name):
         assert self.available_models is None or model_name in self.available_models, (
@@ -228,7 +311,6 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
         )
 
     def prepare_sequences(self, sequences, structures=None):
-
         sequences = [" ".join(s.replace(" ", "")) for s in sequences]
 
         return self.tokenizer.batch_encode_plus(
@@ -240,28 +322,24 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
 
     @torch.no_grad()
     def forward(self, input):
-        attn_mask = input["attention_mask"]
-
-        output = self.model(**input, output_hidden_states=True)
-        hidden_states = output.hidden_states
-        seq_lens = (attn_mask == 1).sum(-1)
+        hidden = self._run_core(input, (self.repr_layer,))
+        seq_lens = (input["attention_mask"] == 1).sum(-1)
 
         for i, seq_len in enumerate(seq_lens):
-            embed = _hf_hidden_at_layer(hidden_states, self.repr_layer)[i]
-            yield self._post_process_embedding(embed.cpu(), seq_len)
+            yield self._post_process_embedding(hidden[i, 0].cpu(), seq_len)
 
     @torch.no_grad()
     def forward_multi(self, input, repr_layers: list[int]):
-        attn_mask = input["attention_mask"]
-
-        output = self.model(**input, output_hidden_states=True)
-        hidden_states = output.hidden_states
-        seq_lens = (attn_mask == 1).sum(-1)
+        hidden = self._run_core(input, repr_layers)
+        seq_lens = (input["attention_mask"] == 1).sum(-1)
 
         for i, seq_len in enumerate(seq_lens):
-            for layer in repr_layers:
-                embed = _hf_hidden_at_layer(hidden_states, layer)[i]
-                yield i, layer, self._post_process_embedding(embed.cpu(), seq_len)
+            for j, layer in enumerate(repr_layers):
+                yield (
+                    i,
+                    layer,
+                    self._post_process_embedding(hidden[i, j].cpu(), seq_len),
+                )
 
 
 class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
@@ -315,8 +393,8 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
             model_name=model_name,
         )
 
-    def _post_process_embedding(self, embedding, seq_len):
-        return embedding[: seq_len - 1]
+    def _post_process_embedding(self, embed, seq_len):
+        return embed[: seq_len - 1]
 
 
 class ESMEmbeddingModel(BaseProteinEmbeddingModel):
@@ -337,6 +415,7 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
 
         self.model.eval()
         _assert_hf_num_hidden_layers(self.model, num_layers, model_name=model_name)
+        self._set_core(_hf_core)
 
     def clean(self, seq):
         if not re.match(r"^[ACDEFGHIKLMNPQRSTVWYX]+$", seq):
@@ -347,7 +426,6 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
         return seq
 
     def prepare_sequences(self, sequences, structures=None):
-
         batch_tokens = self.tokenizer(
             sequences, return_tensors="pt", add_special_tokens=True, padding=True
         )
@@ -357,28 +435,21 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     @torch.no_grad()
     def forward(self, input):
         logger.debug(f"Input: {input}")
-        results = self.model(**input, output_hidden_states=True)
-        token_representations = _hf_hidden_at_layer(
-            results.hidden_states, self.repr_layer
-        )
-
+        hidden = self._run_core(input, (self.repr_layer,))
         seq_lengths = input["attention_mask"].sum(1)
 
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, 1 : seq_len - 1]
+            yield hidden[i, 0, 1 : seq_len - 1]
 
     @torch.no_grad()
     def forward_multi(self, input, repr_layers: list[int]):
         logger.debug(f"Input: {input}")
-        results = self.model(**input, output_hidden_states=True)
+        hidden = self._run_core(input, repr_layers)
         seq_lengths = input["attention_mask"].sum(1)
 
         for i, seq_len in enumerate(seq_lengths):
-            for layer in repr_layers:
-                token_representations = _hf_hidden_at_layer(
-                    results.hidden_states, layer
-                )
-                yield i, layer, token_representations[i, 1 : seq_len - 1]
+            for j, layer in enumerate(repr_layers):
+                yield i, layer, hidden[i, j, 1 : seq_len - 1]
 
 
 def _create_filtered_protein_complex(
@@ -431,13 +502,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         num_layers = len(self.model.transformer.blocks)
         self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
         validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
-
-    def _get_model(self):
-        return (
-            self.model.module
-            if isinstance(self.model, torch.nn.DataParallel)
-            else self.model
-        )
+        self._set_core(_esm3_core, use_norm_layer=use_norm_layer)
 
     def prepare_sequences(
         self,
@@ -465,14 +530,14 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Returns:
             Dict with "sequence_tokens", optional "structure_tokens", for forward.
         """
-        logger.info(f"Preparing sequences for ESM3")
+        logger.info("Preparing sequences for ESM3")
         structure_path = (
             structures
             if isinstance(structures, str)
             else (structures[0] if structures else None)
         )
         use_structure = structure_path is not None
-        model = self._get_model()
+        model = self.model
 
         if structure_path is None:
             # Sequence-only: ESMProtein(sequence=...) then default model.encode()
@@ -584,8 +649,9 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
             }
         return {k: v for k, v in inputs_for_model.items() if v is not None}
 
+    @staticmethod
     def _esm3_transformer_hidden_states(
-        self, model: ESM3, inputs: dict
+        model: ESM3, inputs: dict
     ) -> tuple[torch.Tensor, ...]:
         """Run ESM3 encoder + transformer and return per-block hidden states."""
         from esm.utils.constants import esm3 as C
@@ -625,10 +691,9 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
         def defaults(x, tok):
             if x is None:
-                return torch.full(
-                    (batch_size, L), tok, dtype=torch.long, device=device
-                )
+                return torch.full((batch_size, L), tok, dtype=torch.long, device=device)
             return x
+
         sequence_tokens = defaults(sequence_tokens, t.sequence.mask_token_id)
         ss8_tokens = defaults(ss8_tokens, C.SS8_PAD_TOKEN)
         sasa_tokens = defaults(sasa_tokens, C.SASA_PAD_TOKEN)
@@ -638,12 +703,18 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
         if residue_annotation_tokens is None:
             residue_annotation_tokens = torch.full(
-                (batch_size, L, 16), C.RESIDUE_PAD_TOKEN, dtype=torch.long, device=device
+                (batch_size, L, 16),
+                C.RESIDUE_PAD_TOKEN,
+                dtype=torch.long,
+                device=device,
             )
 
         if function_tokens is None:
             function_tokens = torch.full(
-                (batch_size, L, 8), C.INTERPRO_PAD_TOKEN, dtype=torch.long, device=device
+                (batch_size, L, 8),
+                C.INTERPRO_PAD_TOKEN,
+                dtype=torch.long,
+                device=device,
             )
 
         if structure_coords is None:
@@ -692,8 +763,8 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         """
         Generate embeddings for the input sequences.
 
-        Uses model(**inputs) then output.embeddings. Yields per-sequence embeddings
-        (BOS/EOS stripped). Supports sequence-only or sequence+structure batches.
+        Runs the ESM3 encoder + transformer via the compute core. Yields per-sequence
+        embeddings (BOS/EOS stripped). Supports sequence-only or sequence+structure batches.
         Args:
             input: Dict from prepare_sequences with "sequence_tokens" and
                 optional "structure_tokens" (same-length batch, no padding).
@@ -701,60 +772,48 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
         Yields:
             Embeddings for each sequence (per-residue, without special tokens).
         """
-        device = next(self.model.parameters()).device
-        model = self._get_model()
-
-        inputs = {"sequence_tokens": input["sequence_tokens"].to(device)}
-        if "structure_tokens" in input and input["structure_tokens"] is not None:
-            inputs["structure_tokens"] = input["structure_tokens"].to(device)
-        inputs = {k: v for k, v in inputs.items() if v is not None}
-
-        # ESM3 is often bfloat16; run forward under autocast to avoid Float/BFloat16 mismatch
-        with (
-            torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
-            if device.type == "cuda"
-            else contextlib.nullcontext()
-        ):
-            hidden_states = self._esm3_transformer_hidden_states(model, inputs)
-        num_layers = len(hidden_states)
-        embeddings = _esm3_hidden_at_layer(hidden_states, self.repr_layer)
-        if self.use_norm_layer and self.repr_layer == num_layers:
-            embeddings = model.transformer.norm(embeddings)
-        if embeddings.dtype == torch.bfloat16:
-            embeddings = embeddings.float()
-
-        batch_size = embeddings.shape[0]
-        for i in range(batch_size):
-            yield embeddings[i, 1:-1].cpu()
+        hidden = self._run_core(_esm3_core_inputs(input), (self.repr_layer,))
+        for i in range(hidden.shape[0]):
+            yield hidden[i, 0, 1:-1].cpu()
 
     @torch.no_grad()
     def forward_multi(self, input, repr_layers: list[int]):
-        device = next(self.model.parameters()).device
-        model = self._get_model()
+        hidden = self._run_core(_esm3_core_inputs(input), repr_layers)
+        for i in range(hidden.shape[0]):
+            for j, layer in enumerate(repr_layers):
+                yield i, layer, hidden[i, j, 1:-1].cpu()
 
-        inputs = {"sequence_tokens": input["sequence_tokens"].to(device)}
-        if "structure_tokens" in input and input["structure_tokens"] is not None:
-            inputs["structure_tokens"] = input["structure_tokens"].to(device)
-        inputs = {k: v for k, v in inputs.items() if v is not None}
 
-        with (
-            torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
-            if device.type == "cuda"
-            else contextlib.nullcontext()
-        ):
-            hidden_states = self._esm3_transformer_hidden_states(model, inputs)
-        num_layers = len(hidden_states)
+def _esm3_core_inputs(input) -> dict:
+    inputs = {"sequence_tokens": input["sequence_tokens"]}
+    if input.get("structure_tokens") is not None:
+        inputs["structure_tokens"] = input["structure_tokens"]
+    return inputs
 
-        for layer in repr_layers:
-            embeddings = _esm3_hidden_at_layer(hidden_states, layer)
-            if self.use_norm_layer and layer == num_layers:
-                embeddings = model.transformer.norm(embeddings)
-            if embeddings.dtype == torch.bfloat16:
-                embeddings = embeddings.float()
 
-            batch_size = embeddings.shape[0]
-            for i in range(batch_size):
-                yield i, layer, embeddings[i, 1:-1].cpu()
+def _esm3_core(
+    backbone: ESM3, inputs: dict, layers: tuple[int, ...], use_norm_layer: bool
+):
+    device = inputs["sequence_tokens"].device
+    # ESM3 is often bfloat16; autocast avoids Float/BFloat16 mismatch. Entered here
+    # (not by the caller) because autocast state is thread-local per DataParallel replica.
+    with (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else contextlib.nullcontext()
+    ):
+        hidden_states = ESM3EmbeddingModel._esm3_transformer_hidden_states(
+            backbone, inputs
+        )
+    num_layers = len(hidden_states)
+
+    selected = []
+    for layer in layers:
+        embeddings = _esm3_hidden_at_layer(hidden_states, layer)
+        if use_norm_layer and layer == num_layers:
+            embeddings = backbone.transformer.norm(embeddings)
+        selected.append(embeddings.float())
+    return torch.stack(selected, dim=1)
 
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
@@ -771,34 +830,36 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         self.model, self.tokenizer = load_esmc(model_name)
         self.pad_idx = self.tokenizer.pad_token_id
         _assert_esmc_num_layers(self.model, num_layers, model_name=model_name)
+        self._set_core(_esmc_core)
 
     def prepare_sequences(self, sequences, structures=None):
         return tokenize_esmc_sequences(self.model, sequences)
 
-    @torch.no_grad()
-    def forward(self, input):
-        inputs = dict(input) if hasattr(input, "keys") else {"input_ids": input}
+    def _attention_mask(self, inputs: dict, device: torch.device) -> torch.Tensor:
         attention_mask = inputs.get("attention_mask")
         if attention_mask is None:
             attention_mask = inputs["input_ids"] != self.pad_idx
-        embeddings = esmc_hidden_at_layer(self.model, inputs, self.repr_layer)
+        return attention_mask.to(device).bool()
 
-        for i in range(embeddings.shape[0]):
-            x = embeddings[i][attention_mask[i].bool()]
+    @torch.no_grad()
+    def forward(self, input):
+        inputs = dict(input) if hasattr(input, "keys") else {"input_ids": input}
+        hidden = self._run_core(inputs, (self.repr_layer,))
+        attention_mask = self._attention_mask(inputs, hidden.device)
+
+        for i in range(hidden.shape[0]):
+            x = hidden[i, 0][attention_mask[i]]
             yield x[1:-1].cpu()
 
     @torch.no_grad()
     def forward_multi(self, input, repr_layers: list[int]):
         inputs = dict(input) if hasattr(input, "keys") else {"input_ids": input}
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = inputs["input_ids"] != self.pad_idx
-        hidden_states = esmc_hidden_states(self.model, inputs)
+        hidden = self._run_core(inputs, repr_layers)
+        attention_mask = self._attention_mask(inputs, hidden.device)
 
-        for layer in repr_layers:
-            embeddings = esmc_select_hidden_layer(hidden_states, layer)
-            for i in range(embeddings.shape[0]):
-                x = embeddings[i][attention_mask[i].bool()]
+        for j, layer in enumerate(repr_layers):
+            for i in range(hidden.shape[0]):
+                x = hidden[i, j][attention_mask[i]]
                 yield i, layer, x[1:-1].cpu()
 
 
@@ -811,15 +872,16 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
 
         self.model, self.collater = load_model_and_alphabet(model_name)
         self.model.eval()
-        num_layers = int(self.model.num_layers)
+        num_layers = int(self.model.num_layers)  # pyright: ignore[reportArgumentType]
         self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
         validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
+        self._set_core(_carp_core)
 
     def prepare_sequences(self, sequences, structures=None):
         logger.debug(f"Sequences: {sequences}")
         sequences = [[s] for s in sequences]
 
-        batch_tokens = self.collater(sequences)[0]
+        batch_tokens = self.collater(sequences)[0]  # pyright: ignore[reportIndexIssue]
         logger.debug(f"batch: {batch_tokens}")
 
         return {"tokens": batch_tokens}
@@ -827,27 +889,22 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
     @torch.no_grad()
     def forward(self, input):
         logger.debug(f"Input: {input}")
-        tokens = input["tokens"]
-        results = self.model(tokens, repr_layers=[self.repr_layer], logits=False)
-        token_representations = results["representations"][self.repr_layer]
-        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)
-        logger.debug(f"Token representations: {token_representations}")
+        hidden = self._run_core(input, (self.repr_layer,))
+        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)  # pyright: ignore[reportAttributeAccessIssue]
         logger.debug(f"Sequence lengths: {seq_lengths}")
 
         for i, seq_len in enumerate(seq_lengths):
-            yield token_representations[i, :seq_len]
+            yield hidden[i, 0, :seq_len]
 
     @torch.no_grad()
     def forward_multi(self, input, repr_layers: list[int]):
         logger.debug(f"Input: {input}")
-        tokens = input["tokens"]
-        results = self.model(tokens, repr_layers=list(repr_layers), logits=False)
-        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)
+        hidden = self._run_core(input, repr_layers)
+        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)  # pyright: ignore[reportAttributeAccessIssue]
 
         for i, seq_len in enumerate(seq_lengths):
-            for layer in repr_layers:
-                token_representations = results["representations"][layer]
-                yield i, layer, token_representations[i, :seq_len]
+            for j, layer in enumerate(repr_layers):
+                yield i, layer, hidden[i, j, :seq_len]
 
 
 class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
@@ -871,6 +928,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         self.model = ProteinMPNN.from_pretrained(model_name, ca_only=ca_only)
         self.model.eval()
         self.ca_only = ca_only
+        self._set_core(_mpnn_core)
 
     def prepare_sequences(self, sequences, structures=None):
         """
@@ -975,29 +1033,33 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         Yields:
             Embeddings for each sequence (per-residue)
         """
-        device = next(self.model.parameters()).device
-        X = input["X"].to(device)
-        S = input["S"].to(device)
-        mask = input["mask"].to(device)
-        residue_idx = input["residue_idx"].to(device)
-        chain_encoding_all = input["chain_encoding_all"].to(device)
-        lengths = input["lengths"]
+        core_inputs = {k: input[k] for k in _MPNN_CORE_KEYS}
+        h_V = self._run_core(core_inputs, (0,))
+        # ``lengths`` stays out of the core: it is not a batch-first tensor to scatter.
+        for i, seq_len in enumerate(input["lengths"]):
+            yield h_V[i, 0, :seq_len].cpu()
 
-        E, E_idx = self.model.features(X, mask, residue_idx, chain_encoding_all)
-        h_S = self.model.W_s(S)
-        h_V = h_S.clone()
-        h_E = self.model.W_e(E)
 
-        # Masking for attention (gather_nodes is used both in mpnn.py and here)
-        mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
-        mask_attend = mask.unsqueeze(-1) * mask_attend
+_MPNN_CORE_KEYS = ("X", "S", "mask", "residue_idx", "chain_encoding_all")
 
-        # Pass through encoder layers (exact order/inputs as in mpnn.py)
-        for layer in self.model.encoder_layers:
-            h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
 
-        for i, seq_len in enumerate(lengths):
-            yield h_V[i, :seq_len].cpu()
+def _mpnn_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
+    """ProteinMPNN encoder output ``[B, 1, L, D]``; ``layers`` is ignored (single output)."""
+    X, S, mask = inputs["X"], inputs["S"], inputs["mask"]
+    E, E_idx = backbone.features(
+        X, mask, inputs["residue_idx"], inputs["chain_encoding_all"]
+    )
+    h_V = backbone.W_s(S).clone()
+    h_E = backbone.W_e(E)
+
+    # Masking for attention (gather_nodes is used both in mpnn.py and here)
+    mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
+    mask_attend = mask.unsqueeze(-1) * mask_attend
+
+    # Pass through encoder layers (exact order/inputs as in mpnn.py)
+    for layer in backbone.encoder_layers:
+        h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
+    return h_V.unsqueeze(1)
 
 
 @dataclass

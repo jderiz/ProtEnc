@@ -61,7 +61,7 @@ def _ensure_esmc_tokenizer_hub_alias() -> None:
     class EsmcTokenizer(base):  # type: ignore[valid-type,misc]
         pass
 
-    transformers.EsmcTokenizer = EsmcTokenizer
+    setattr(transformers, "EsmcTokenizer", EsmcTokenizer)
 
 
 _ESMC_LEGACY_PTH: dict[str, dict[str, Any]] = {
@@ -130,7 +130,9 @@ def _load_esmc_legacy_nested_pth(
         state = state["model"]
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
-        raise RuntimeError(f"ESMC legacy pth load missing keys for {alias}: {missing[:8]}...")
+        raise RuntimeError(
+            f"ESMC legacy pth load missing keys for {alias}: {missing[:8]}..."
+        )
     if unexpected:
         # Non-fatal for auxiliary buffers; still surface for debugging.
         pass
@@ -185,14 +187,18 @@ def is_esmc_hf_model(model: Any) -> bool:
     return is_esmc_model(model)
 
 
-def _sequence_tokens(model: ESMC, inputs: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+def _sequence_tokens(
+    model: ESMC, inputs: torch.Tensor | dict[str, torch.Tensor]
+) -> torch.Tensor:
     if isinstance(inputs, dict):
         return inputs["input_ids"]
     return inputs
 
 
 def _attention_mask(
-    model: ESMC, sequence_tokens: torch.Tensor, inputs: torch.Tensor | dict[str, torch.Tensor]
+    model: ESMC,
+    sequence_tokens: torch.Tensor,
+    inputs: torch.Tensor | dict[str, torch.Tensor],
 ) -> torch.Tensor:
     if isinstance(inputs, dict) and "attention_mask" in inputs:
         return inputs["attention_mask"].bool()
@@ -220,7 +226,9 @@ def esmc_hidden_states(
     return torch.cat([embedded.unsqueeze(0), output.hidden_states], dim=0)
 
 
-def esmc_select_hidden_layer(hidden_states: torch.Tensor, repr_layer: int) -> torch.Tensor:
+def esmc_select_hidden_layer(
+    hidden_states: torch.Tensor, repr_layer: int
+) -> torch.Tensor:
     """Select a 1-indexed representation layer from stacked ESMC hidden states."""
     return hidden_states[repr_layer]
 

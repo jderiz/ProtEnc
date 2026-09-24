@@ -1,13 +1,14 @@
-import torch
-import torch.nn as nn
-import protenc.utils as utils
-
+import warnings
+from collections.abc import Mapping
 from functools import cached_property
-from tqdm import tqdm
-from protenc.types import BatchSize, ProteinEncoderInput, ReturnFormat
+
+import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+import protenc.utils as utils
 from protenc.models import BaseProteinEmbeddingModel, EmbeddingType, get_model
-from protenc.esmc_loading import is_esmc_model
+from protenc.types import BatchSize, ProteinEncoderInput, ReturnFormat
 
 
 class ProteinEncoder:
@@ -23,7 +24,7 @@ class ProteinEncoder:
         batch_size: BatchSize = None,
         autocast: bool = False,
         preprocess_workers: int = 0,
-        dataloader: DataLoader = DataLoader,
+        dataloader: type[DataLoader] = DataLoader,
         data_parallel: bool = False,
         device_ids: list[int] | None = None,
         empty_cache_on_batch: bool = False,
@@ -44,7 +45,7 @@ class ProteinEncoder:
                 batch during encoding. Defaults to False because per-batch cache clearing
                 hurts throughput; cache is still cleared on CUDA OOM recovery.
         """
-        self.model = model
+        self.model: BaseProteinEmbeddingModel = model
         self.batch_size = 1 if batch_size is None else batch_size
         self._same_length_batch = getattr(model, "requires_same_length_batch", False)
         self.autocast = autocast  # Automatic mixed precision, saves memory and time at little accuracy cost
@@ -54,64 +55,41 @@ class ProteinEncoder:
         self.device_ids = device_ids
         self.empty_cache_on_batch = empty_cache_on_batch
 
-        # Apply data parallel if requested and CUDA is available
+        self._primary_device: torch.device | None = None
+
+        # Replicate the model's compute core across GPUs if requested
         if self.data_parallel and torch.cuda.is_available():
-            # Check if this is an ESMC model - DataParallel doesn't work well with ESMC
-            is_esmc_model_flag = False
-            if hasattr(self.model, "model"):
-                if is_esmc_model(self.model.model):
-                    is_esmc_model_flag = True
-            elif is_esmc_model(self.model):
-                is_esmc_model_flag = True
-
-            if is_esmc_model_flag:
-                import warnings
-
+            if self.device_ids is None:
+                self.device_ids = list(range(torch.cuda.device_count()))
+            try:
+                self._primary_device = torch.device(f"cuda:{self.device_ids[0]}")
+                self.model.to(self._primary_device)
+                self.model.enable_data_parallel(self.device_ids)
+            except Exception as e:
                 warnings.warn(
-                    "DataParallel is not supported for ESMC models due to ESMCOutput compatibility issues. "
-                    "Falling back to single GPU for ESMC models."
+                    f"Failed to initialize data parallel: {e}. Falling back to single GPU."
                 )
                 self.data_parallel = False
-            else:
-                # Apply DataParallel for other models
-                try:
-                    parallel_device_ids = self.device_ids
-                    if parallel_device_ids is None and torch.cuda.is_available():
-                        parallel_device_ids = list(range(torch.cuda.device_count()))
-
-                    if hasattr(self.model, "model"):
-                        # Some models wrap the actual model in a .model attribute
-                        self.model.model = nn.DataParallel(
-                            self.model.model, device_ids=parallel_device_ids
-                        )
-                    else:
-                        # Direct model wrapping
-                        self.model = nn.DataParallel(
-                            self.model, device_ids=parallel_device_ids
-                        )
-                except Exception as e:
-                    import warnings
-
-                    warnings.warn(
-                        f"Failed to initialize data parallel: {e}. Falling back to single GPU."
-                    )
-                    self.data_parallel = False
+                self._primary_device = None
 
         # Validate data parallel setup
         if self.data_parallel:
-            import warnings
-
             if not torch.cuda.is_available():
                 warnings.warn("Data parallel requested but CUDA is not available")
-            elif torch.cuda.device_count() < 2:
+            elif len(self.device_ids or []) < 2:
                 warnings.warn("Data parallel requested but only one GPU is available")
+            elif self.batch_size < len(self.device_ids):
+                warnings.warn(
+                    f"batch_size={self.batch_size} is smaller than the number of GPUs "
+                    f"({len(self.device_ids)}); some GPUs will be idle."
+                )
 
     @cached_property
     def device(self):
         """Get the device of the model, handling data parallel models."""
-        if self.data_parallel and torch.cuda.is_available():
-            # For data parallel models, return the primary device (cuda:0)
-            return torch.device("cuda:0")
+        if self.is_data_parallel and self._primary_device is not None:
+            # For data parallel models, return the primary device (device_ids[0])
+            return self._primary_device
         else:
             # For single device models, get device from parameters
             return next(iter(self.model.parameters())).device
@@ -123,8 +101,6 @@ class ProteinEncoder:
 
     def _get_primary_device(self):
         """Get the primary device for data parallel models."""
-        if self.is_data_parallel:
-            return torch.device("cuda:0")
         return self.device
 
     def get_data_parallel_info(self):
@@ -132,11 +108,6 @@ class ProteinEncoder:
         if not self.is_data_parallel:
             return {"enabled": False, "device_count": 1, "devices": [str(self.device)]}
 
-        device_count = (
-            len(self.device_ids)
-            if self.device_ids is not None
-            else torch.cuda.device_count()
-        )
         if self.device_ids is not None:
             devices = [f"cuda:{i}" for i in self.device_ids]
         else:
@@ -156,7 +127,7 @@ class ProteinEncoder:
         if self.data_parallel:
             if not torch.cuda.is_available():
                 issues.append("Data parallel requested but CUDA is not available")
-            elif torch.cuda.device_count() < 2:
+            elif len(self.device_ids or []) < 2:
                 issues.append("Data parallel requested but only one GPU is available")
 
         return issues
@@ -168,27 +139,17 @@ class ProteinEncoder:
 
         Defaults to empty string when the model does not define one.
         """
-        model = self.model
-        # When DataParallel is applied, the wrapped module may live under .module
-        if isinstance(model, nn.DataParallel):
-            model = model.module
-        return getattr(model, "chain_break_token", "")
+        return getattr(self.model, "chain_break_token", "")
 
     @property
     def repr_layer(self) -> int | None:
         """Representation layer used by the underlying embedding model."""
-        model = self.model
-        if isinstance(model, nn.DataParallel):
-            model = model.module
-        return getattr(model, "repr_layer", None)
+        return getattr(self.model, "repr_layer", None)
 
     @property
     def repr_layers(self) -> list[int] | None:
         """Layers extracted in the multi-layer path (None for single-layer)."""
-        model = self.model
-        if isinstance(model, nn.DataParallel):
-            model = model.module
-        return getattr(model, "repr_layers", None)
+        return getattr(self.model, "repr_layers", None)
 
     def _iter_batches(self, proteins: list[str]):
         """Iterate (batch_indices, batch_sequences). Same-length models: group by length then chunk; else consecutive chunks."""
@@ -196,6 +157,7 @@ class ProteinEncoder:
         n = len(proteins)
         if self._same_length_batch:
             from collections import defaultdict
+
             by_len = defaultdict(list)
             for i, p in enumerate(proteins):
                 by_len[len(p)].append(i)
@@ -218,6 +180,7 @@ class ProteinEncoder:
     ):
         """Prepare protein sequences for encoding, optionally with structures."""
         import inspect
+
         try:
             sig = inspect.signature(self.model.prepare_sequences)
             kwargs = {}
@@ -248,37 +211,32 @@ class ProteinEncoder:
             self._maybe_empty_cache(force=True)
             return encode_fn()
 
-    def _underlying_model(self) -> BaseProteinEmbeddingModel:
-        model = self.model
-        if isinstance(model, nn.DataParallel):
-            model = model.module
-        return model
-
-    def _maybe_pool_embedding(self, embed: torch.Tensor, average_sequence: bool) -> torch.Tensor:
+    def _maybe_pool_embedding(
+        self, embed: torch.Tensor, average_sequence: bool
+    ) -> torch.Tensor:
         if not average_sequence:
             return embed
-        if self._underlying_model().embedding_kind == EmbeddingType.PER_RESIDUE:
+        if self.model.embedding_kind == EmbeddingType.PER_RESIDUE:
             if embed.ndim >= 2:
                 return embed.mean(0)
         return embed
 
     def _encode(self, batch):
         """Process a batch through the model and return embeddings."""
-        with torch.inference_mode(), torch.amp.autocast(
-            device_type=self.device.type, enabled=self.autocast
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=self.device.type, enabled=self.autocast),
         ):
             # calls model.forward()
             return self.model(batch)
 
     def _encode_multi(self, batch, repr_layers: list[int]):
         """Process a batch through model.forward_multi for multiple layers."""
-        model = self.model
-        if isinstance(model, nn.DataParallel):
-            model = model.module
-        with torch.inference_mode(), torch.amp.autocast(
-            device_type=self.device.type, enabled=self.autocast
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=self.device.type, enabled=self.autocast),
         ):
-            return model.forward_multi(batch, repr_layers)
+            return self.model.forward_multi(batch, repr_layers)
 
     def _encode_batches(
         self,
@@ -333,8 +291,8 @@ class ProteinEncoder:
         )
 
     def _batch_to_device(self, batch, target_device: torch.device):
-        """Move batch tensors to device (dict, list, or single tensor)."""
-        if isinstance(batch, dict):
+        """Move batch tensors to device (mapping, list, or single tensor)."""
+        if isinstance(batch, Mapping):  # includes transformers BatchEncoding
             return {
                 k: v.to(target_device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
@@ -378,7 +336,7 @@ class ProteinEncoder:
 
                 batch = self._batch_to_device(prepared_batch, target_device)
                 model_output = self._run_encode_with_oom_recovery(
-                    lambda: self._encode(batch)
+                    lambda b=batch: self._encode(b)
                 )
                 try:
                     for i, embed in enumerate(model_output):
@@ -438,7 +396,7 @@ class ProteinEncoder:
 
                 batch = self._batch_to_device(prepared_batch, target_device)
                 model_output = self._run_encode_with_oom_recovery(
-                    lambda: self._encode_multi(batch, repr_layers)
+                    lambda b=batch: self._encode_multi(b, repr_layers)
                 )
                 try:
                     for i, layer, embed in model_output:
@@ -540,19 +498,7 @@ class ProteinEncoder:
         """
         batch = self.prepare_sequences(proteins, structures)
 
-        # Move batch to device
-        target_device = self._get_primary_device()
-        if isinstance(batch, dict):
-            # Move tensors to device
-            batch = {
-                k: v.to(target_device) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
-        elif isinstance(batch, list):
-            # Handle list of tensors (for ESM3)
-            batch = [b.to(target_device) if hasattr(b, "to") else b for b in batch]
-        else:
-            batch = batch.to(target_device)
+        batch = self._batch_to_device(batch, self._get_primary_device())
 
         # Get embeddings from generator
         model_output = self._encode(batch)
@@ -561,7 +507,10 @@ class ProteinEncoder:
         # For batched output, stack the embeddings
         if len(embeds) > 1:
             stacked_embeds = torch.stack(embeds)
-            if average_sequence and self._underlying_model().embedding_kind == EmbeddingType.PER_RESIDUE:
+            if (
+                average_sequence
+                and self.model.embedding_kind == EmbeddingType.PER_RESIDUE
+            ):
                 stacked_embeds = stacked_embeds.mean(1)
             return utils.to_return_format(stacked_embeds.cpu(), return_format)
         else:
