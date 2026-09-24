@@ -6,15 +6,16 @@ Download weights before running integration tests::
     hf download biohub/ESMC-600M
     hf download biohub/ESMC-6B
 """
+
 import pytest
 import torch
 
+from protenc.esmc_loading import ESMC_HF_REPOS, resolve_esmc_repo_id
 from protenc.models import (
     _esmc_num_layers_from_name,
     get_model,
     get_model_info,
 )
-from protenc.esmc_loading import ESMC_HF_REPOS, resolve_esmc_repo_id
 
 
 @pytest.mark.parametrize(

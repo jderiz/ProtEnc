@@ -1,8 +1,9 @@
-from functools import wraps
 import inspect
-import torch
-import pytest
 import warnings
+from functools import wraps
+
+import pytest
+import torch
 
 from protenc.models import get_model_info, list_models
 
@@ -14,13 +15,13 @@ def skip_no_gpu(fn):
     def wrapper(*args, **kwargs):
         bound = sig.bind_partial(*args, **kwargs)
         bound.apply_defaults()
-        device = bound.arguments.get('device', 'cpu')
+        device = bound.arguments.get("device", "cpu")
 
-        if device == 'cuda' and not torch.cuda.is_available():
-            pytest.skip('No GPU available')
-        
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("No GPU available")
+
         return fn(*args, **kwargs)
-    
+
     return wrapper
 
 
@@ -32,20 +33,27 @@ def skip_large_models(max_embed_dim=None):
         def wrapper(*args, **kwargs):
             bound = sig.bind_partial(*args, **kwargs)
             bound.apply_defaults()
-            model_name = bound.arguments.get('model_name')
+            model_name = bound.arguments.get("model_name")
 
             if model_name is not None:
                 model_info = get_model_info(model_name)
-                if max_embed_dim is not None and model_info['embed_dim'] > max_embed_dim:
-                    pytest.skip(f'Model too large ({model_info["embed_dim"]} > {max_embed_dim} embed dimensions)')
+                if (
+                    max_embed_dim is not None
+                    and model_info["embed_dim"] > max_embed_dim
+                ):
+                    pytest.skip(
+                        f"Model too large ({model_info['embed_dim']} > {max_embed_dim} embed dimensions)"
+                    )
             else:
-                warnings.warn('Test decorated with @skip_large_model but no model_name argument found. '
-                              'This is probably a mistake.')
+                warnings.warn(
+                    "Test decorated with @skip_large_model but no model_name argument found. "
+                    "This is probably a mistake."
+                )
 
             return fn(*args, **kwargs)
-        
+
         return wrapper
-    
+
     return wrap
 
 
@@ -53,5 +61,5 @@ def list_models_to_test(max_embed_dim=512):
     return [
         model_name
         for model_name in list_models()
-        if get_model_info(model_name)['embed_dim'] <= max_embed_dim
+        if get_model_info(model_name)["embed_dim"] <= max_embed_dim
     ]
