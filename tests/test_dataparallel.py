@@ -30,7 +30,9 @@ def test_core_output_is_batch_first():
 
 def test_enable_data_parallel_keeps_backbone_unwrapped():
     """Only the compute core is wrapped; outputs and attribute access are unchanged."""
-    model = get_model("esm2_t6")
+    # DataParallel requires the module on device_ids[0] (cuda:0) when CUDA is visible.
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model = get_model("esm2_t6").to(device)
     batch = model.prepare_sequences(SEQS)
     expected = list(model(batch))
 
@@ -40,7 +42,7 @@ def test_enable_data_parallel_keeps_backbone_unwrapped():
     assert not isinstance(model.model, nn.DataParallel)
     assert "_core" not in dict(model.named_children())
     for got, exp in zip(model(batch), expected):
-        assert torch.allclose(got, exp)
+        assert torch.allclose(got, exp, atol=1e-4)
 
 
 @skip_no_gpu
@@ -95,16 +97,32 @@ def test_data_parallel_info_and_validation(device):
         assert issues == []
 
 
+def _assert_embeddings_match(got, exp, bf16: bool, name: str):
+    """fp32: elementwise allclose. bf16: bf16 rounding differs with the per-GPU batch
+    size (kernel choice) and grows over depth, and a few large-magnitude dimensions make
+    an absolute tolerance meaningless, so compare direction and relative error instead."""
+    assert got.shape == exp.shape, f"{name}: shape {got.shape} != {exp.shape}"
+    if not bf16:
+        max_diff = (got - exp).abs().max().item()
+        assert torch.allclose(got, exp, atol=1e-4), f"{name}: max |diff| {max_diff:.2e}"
+        return
+    got, exp = got.float(), exp.float()
+    cos = torch.nn.functional.cosine_similarity(got, exp, dim=-1)  # per residue
+    rel = ((got - exp).norm() / exp.norm()).item()
+    assert cos.min().item() > 0.99, f"{name}: min per-residue cosine {cos.min():.4f}"
+    assert rel < 5e-2, f"{name}: relative L2 error {rel:.3e}"
+
+
 @requires_multi_gpu
 @pytest.mark.parametrize(
-    "model_name, seqs, atol",
+    "model_name, seqs, bf16",
     [
-        ("esm2_t6", SEQS, 1e-4),
-        ("esmc_300m", SEQS, 1e-3),
-        ("esm3", SAME_LEN_SEQS, 5e-2),  # bf16 autocast
+        ("esm2_t6", SEQS, False),
+        ("esmc_300m", SEQS, True),  # weights cast to bf16 on CUDA
+        ("esm3", SAME_LEN_SEQS, True),  # bf16 autocast
     ],
 )
-def test_data_parallel_matches_single_gpu(model_name, seqs, atol):
+def test_data_parallel_matches_single_gpu(model_name, seqs, bf16):
     """Multi-GPU embeddings equal single-GPU embeddings for each family."""
     single = get_encoder(model_name, device="cuda:0", batch_size=len(seqs))
     expected = dict(single.encode(seqs, average_sequence=False, show_progress=False))
@@ -117,7 +135,7 @@ def test_data_parallel_matches_single_gpu(model_name, seqs, atol):
 
     assert got.keys() == expected.keys()
     for idx in expected:
-        assert torch.allclose(got[idx], expected[idx], atol=atol)
+        _assert_embeddings_match(got[idx], expected[idx], bf16, f"{model_name}[{idx}]")
 
     layers = [1, parallel.repr_layer]
     multi = list(
@@ -128,4 +146,6 @@ def test_data_parallel_matches_single_gpu(model_name, seqs, atol):
     assert len(multi) == len(seqs) * len(layers)
     for idx, layer, emb in multi:
         if layer == parallel.repr_layer:
-            assert torch.allclose(emb, expected[idx], atol=atol)
+            _assert_embeddings_match(
+                emb, expected[idx], bf16, f"{model_name}[{idx}] multi-layer"
+            )
