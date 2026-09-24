@@ -264,7 +264,28 @@ class BaseProteinEmbeddingModel(nn.Module):
             k: v.to(device) if isinstance(v, torch.Tensor) else v
             for k, v in dict(input).items()
         }
+        if self.is_data_parallel:
+            _drop_self_bound_forwards(self.model)
         return self._core(inputs, tuple(layers))
+
+
+def _drop_self_bound_forwards(module: nn.Module) -> None:
+    """Remove instance-level ``forward`` attributes that just re-bind the class forward.
+
+    transformers' ``check_model_inputs`` (output capturing for ``output_hidden_states``)
+    "restores" patched layers with ``module.forward = <bound method of module>``, leaving
+    an instance attribute behind after the first call. ``nn.DataParallel.replicate``
+    shallow-copies ``__dict__``, so every replica would then call the original module's
+    forward with its cuda:0 weights. Deleting the attribute is a no-op for normal calls.
+    """
+    for m in module.modules():
+        fwd = m.__dict__.get("forward")
+        if (
+            fwd is not None
+            and getattr(fwd, "__self__", None) is m
+            and getattr(fwd, "__func__", None) is type(m).forward
+        ):
+            del m.__dict__["forward"]
 
 
 def load_huggingface_language_model(

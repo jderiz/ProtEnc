@@ -45,6 +45,22 @@ def test_enable_data_parallel_keeps_backbone_unwrapped():
         assert torch.allclose(got, exp, atol=1e-4)
 
 
+def test_drop_self_bound_forwards_after_unwrapped_call():
+    """An unwrapped HF forward leaves self-bound ``forward`` attributes on layers
+    (transformers output capturing); they must be removed before replication, or
+    DataParallel replicas call the original module on cuda:0."""
+    from protenc.models import _drop_self_bound_forwards
+
+    model = get_model("esm2_t6")
+    list(model(model.prepare_sequences(SEQS)))
+    assert any("forward" in m.__dict__ for m in model.model.modules())
+
+    _drop_self_bound_forwards(model.model)
+
+    assert not any("forward" in m.__dict__ for m in model.model.modules())
+    list(model(model.prepare_sequences(SEQS)))  # still runs
+
+
 @skip_no_gpu
 @pytest.mark.parametrize("device", ["cuda"])
 def test_esmc_data_parallel_enabled_on_get_encoder(device):
