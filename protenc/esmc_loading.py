@@ -54,7 +54,7 @@ def _ensure_esmc_tokenizer_hub_alias() -> None:
     base = getattr(transformers, "ESMCTokenizer", None)
     if base is None:
         try:
-            from transformers.models.esmc.tokenization_esmc import ESMCTokenizer as base
+            from esm.models.esmc import EsmcTokenizer as base
         except ImportError:
             return
 
