@@ -579,9 +579,10 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
 
                 if chain_list is not None:
                     # Fast path: HAIPRData guarantees sequences are already in chain_list
-                    # order (split on "|"). Strip "|" to produce a flat sequence whose
-                    # residue count matches shared_coordinates exactly.
-                    flat_sequences = [seq.replace("|", "") for seq in sequences]
+                    # order (split on "|"). ProteinComplex.from_chains inserts one
+                    # chain-break row between chains, so keep "|" to match
+                    # shared_coordinates and the sequence-only token layout.
+                    flat_sequences = list(sequences)
                 else:
                     # Slow path: align sequences to PDB chain order via biotite.
                     flat_sequences = []
@@ -612,9 +613,9 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                                     chain_to_seq.get(c.chain_id, "") or str(c.sequence)
                                     for c in pc.chain_iter()
                                 ]
-                                flat_sequences.append("".join(aligned_parts))
+                                flat_sequences.append("|".join(aligned_parts))
                             elif len(parts) == len(loaded_chain_ids):
-                                flat_sequences.append(seq.replace("|", ""))
+                                flat_sequences.append(seq)
                             else:
                                 logger.warning(
                                     f"Sequence parts ({len(parts)}) don't match PDB chains "
@@ -628,6 +629,16 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
                             "falling back to stripping chain-break tokens."
                         )
                         flat_sequences = [seq.replace("|", "") for seq in sequences]
+
+                if shared_coordinates is not None:
+                    n_coords = shared_coordinates.shape[0]
+                    bad = [s for s in flat_sequences if len(s) != n_coords]
+                    if bad:
+                        raise ValueError(
+                            f"{len(bad)} sequence(s) do not match the structure length "
+                            f"{n_coords} (first has length {len(bad[0])}); chains "
+                            f"{[c.chain_id for c in pc.chain_iter()]}"
+                        )
 
                 proteins = [
                     ESMProtein(sequence=flat_seq, coordinates=shared_coordinates)
