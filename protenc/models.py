@@ -149,8 +149,24 @@ def _hf_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
     )
 
 
-def _esmc_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
+def _esmc_core(
+    backbone: nn.Module,
+    inputs: dict,
+    layers: tuple[int, ...],
+    use_norm_layer: bool = True,
+):
     hidden_states = esmc_hidden_states(backbone, inputs)  # [n_layers + 1, B, L, D]
+    if use_norm_layer:
+        # Index 0 is the embedding layer, so the last block is index n_layers.
+        num_layers = hidden_states.shape[0] - 1
+        norm = backbone.transformer.norm
+        selected = []
+        for layer in layers:
+            embeddings = esmc_select_hidden_layer(hidden_states, layer)
+            if layer == num_layers:
+                embeddings = norm(embeddings.to(next(norm.parameters()).dtype))
+            selected.append(embeddings.float())
+        return torch.stack(selected, dim=1)
     return torch.stack(
         [esmc_select_hidden_layer(hidden_states, layer) for layer in layers], dim=1
     )
@@ -853,7 +869,12 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     structure_aware = False
     chain_break_token: str = "|"
 
-    def __init__(self, model_name: str, repr_layer: int | None = None):
+    def __init__(
+        self,
+        model_name: str,
+        repr_layer: int | None = None,
+        use_norm_layer: bool = True,
+    ):
         super().__init__()
         num_layers = _esmc_num_layers_from_name(model_name)
         self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
@@ -862,7 +883,8 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
         self.model, self.tokenizer = load_esmc(model_name)
         self.pad_idx = self.tokenizer.pad_token_id
         _assert_esmc_num_layers(self.model, num_layers, model_name=model_name)
-        self._set_core(_esmc_core)
+        self.use_norm_layer = use_norm_layer
+        self._set_core(_esmc_core, use_norm_layer=use_norm_layer)
 
     def prepare_sequences(self, sequences, structures=None):
         return tokenize_esmc_sequences(self.model, sequences)

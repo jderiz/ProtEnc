@@ -79,3 +79,42 @@ def test_esmc_repr_layer_forward(alias):
     assert model_default.repr_layer == info["num_layers"]
     assert model_mid.repr_layer == 10
     assert not torch.allclose(out_default, out_mid)
+
+
+def test_esmc_core_applies_final_norm(monkeypatch):
+    """The last ESMC layer goes through the backbone's final LayerNorm.
+
+    Without it the core returns the unnormalized residual stream, which is a
+    different representation (orders of magnitude larger) and, per the ESMC
+    loader's own warning, kernel-dependent. Intermediate layers stay raw, which
+    matches the ESM3 path.
+    """
+    from protenc import models
+
+    torch.manual_seed(0)
+    num_layers, batch, length, dim = 3, 2, 4, 6
+    hidden = torch.randn(num_layers + 1, batch, length, dim) * 100
+    monkeypatch.setattr(models, "esmc_hidden_states", lambda backbone, inputs: hidden)
+
+    backbone = torch.nn.Module()
+    backbone.transformer = torch.nn.Module()
+    backbone.transformer.norm = torch.nn.LayerNorm(dim)
+
+    normed = models._esmc_core(backbone, {}, (num_layers,), use_norm_layer=True)
+    raw = models._esmc_core(backbone, {}, (num_layers,), use_norm_layer=False)
+
+    assert torch.allclose(normed[:, 0], backbone.transformer.norm(hidden[num_layers]), atol=1e-5)
+    assert torch.allclose(raw[:, 0], hidden[num_layers])
+    assert normed[:, 0].abs().max() < raw[:, 0].abs().max()
+
+    intermediate = models._esmc_core(backbone, {}, (1,), use_norm_layer=True)
+    assert torch.allclose(intermediate[:, 0], hidden[1])
+
+
+def test_esmc_model_defaults_to_norm_layer():
+    """ESMC defaults to applying the final norm, matching ESM3's default."""
+    import inspect
+
+    from protenc.models import ESMCEmbeddingModel
+
+    assert inspect.signature(ESMCEmbeddingModel).parameters["use_norm_layer"].default is True
