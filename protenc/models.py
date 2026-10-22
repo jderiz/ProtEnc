@@ -926,7 +926,9 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
 
         self.model, self.collater = load_model_and_alphabet(model_name)
         self.model.eval()
-        num_layers = int(self.model.num_layers)  # pyright: ignore[reportArgumentType]
+        # CARP wraps a ByteNetLM and exposes no layer count of its own, so take it from
+        # the ByteNet block list.
+        num_layers = len(self.model.model.embedder.layers)  # pyright: ignore[reportArgumentType]
         self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
         validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
         self._set_core(_carp_core)
