@@ -14,6 +14,7 @@ from esm.models.esm3 import ESM3
 from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProtein, ProteinComplex
 from esm.utils.structure.protein_chain import ProteinChain
+from sequence_models.constants import GAP
 from sequence_models.pretrained import load_model_and_alphabet
 from transformers import (
     AutoTokenizer,
@@ -920,6 +921,14 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_PROTEIN
     structure_aware = False
+    # CARP's PROTEIN_ALPHABET is "ACDEFGHIKLMNPQRSTVWYBZXJOU*-#@" and holds no
+    # chain-break character: sequence_models defines SEP as "/", but only inside
+    # MSA_ALPHABET_PLUS, so the collater raises KeyError on the canonical "|".
+    # GAP is the one alphabet member with separator-like semantics, so multi-chain
+    # input joins on it. Declaring the token here is enough for
+    # EmbeddingManager._normalize_chain_breaks to rewrite "|" before tokenization,
+    # and cache keys canonicalize back to "|" before hashing, so they do not move.
+    chain_break_token: str = GAP
 
     def __init__(self, model_name: str, repr_layer: int | None = None):
         super().__init__()
@@ -935,18 +944,33 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
 
     def prepare_sequences(self, sequences, structures=None):
         logger.debug(f"Sequences: {sequences}")
+        lengths = torch.tensor([len(s) for s in sequences], dtype=torch.long)
         sequences = [[s] for s in sequences]
 
         batch_tokens = self.collater(sequences)[0]  # pyright: ignore[reportIndexIssue]
         logger.debug(f"batch: {batch_tokens}")
 
-        return {"tokens": batch_tokens}
+        return {"tokens": batch_tokens, "lengths": lengths}
+
+    def _sequence_lengths(self, input) -> torch.Tensor:
+        """Unpadded length per row.
+
+        GAP and PAD are both "-" in CARP, so a chain break is indistinguishable from
+        padding once tokenized: counting non-pad tokens undercounts by one per break
+        and the contiguous slice that follows would drop the final residue of every
+        multi-chain sequence. Use the lengths recorded at tokenization time, and keep
+        the token comparison only for inputs built without them.
+        """
+        lengths = input.get("lengths")
+        if lengths is not None:
+            return lengths
+        return (input["tokens"] != self.collater.pad_idx).sum(1)  # pyright: ignore[reportAttributeAccessIssue]
 
     @torch.no_grad()
     def forward(self, input):
         logger.debug(f"Input: {input}")
         hidden = self._run_core(input, (self.repr_layer,))
-        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)  # pyright: ignore[reportAttributeAccessIssue]
+        seq_lengths = self._sequence_lengths(input)
         logger.debug(f"Sequence lengths: {seq_lengths}")
 
         for i, seq_len in enumerate(seq_lengths):
@@ -956,7 +980,7 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
     def forward_multi(self, input, repr_layers: list[int]):
         logger.debug(f"Input: {input}")
         hidden = self._run_core(input, repr_layers)
-        seq_lengths = (input["tokens"] != self.collater.pad_idx).sum(1)  # pyright: ignore[reportAttributeAccessIssue]
+        seq_lengths = self._sequence_lengths(input)
 
         for i, seq_len in enumerate(seq_lengths):
             for j, layer in enumerate(repr_layers):
