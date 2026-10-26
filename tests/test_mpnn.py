@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 import torch
 
-from protenc.mpnn import ProteinMPNN
 from protenc.models import ProteinMPNNEmbeddingModel, _mpnn_encode
+from protenc.mpnn import ProteinMPNN
 
 from .fixtures import write_backbone_pdb
 
