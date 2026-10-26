@@ -1010,17 +1010,9 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
     requires_same_length_batch = True
 
     def __init__(
-        self,
-        model_name: str,
-        ca_only: bool = False,
-        use_structure: bool = True,
-        decoding: str = "leave_one_out",
+        self, model_name: str, ca_only: bool = False, use_structure: bool = True
     ):
         super().__init__()
-        if decoding not in _MPNN_DECODINGS:
-            raise ValueError(
-                f"decoding must be one of {_MPNN_DECODINGS}, got {decoding!r}"
-            )
         print(f"Initializing ProteinMPNN embedding model with model name: {model_name}")
 
         cache_dir = torch.hub.get_dir()
@@ -1034,7 +1026,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         self.model = ProteinMPNN.from_pretrained(model_name, ca_only=ca_only)
         self.model.eval()
         self.ca_only = ca_only
-        self._set_core(_mpnn_core, decoding=decoding)
+        self._set_core(_mpnn_core)
 
     def prepare_sequences(self, sequences, structures=None):
         """
@@ -1147,7 +1139,6 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
 
 
 _MPNN_CORE_KEYS = ("X", "S", "mask", "residue_idx", "chain_encoding_all")
-_MPNN_DECODINGS = ("leave_one_out", "left_to_right")
 
 
 def _mpnn_encode(backbone: nn.Module, inputs: dict):
@@ -1192,31 +1183,20 @@ def _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, visible):
     return h_V
 
 
-def _mpnn_core(
-    backbone: nn.Module,
-    inputs: dict,
-    layers: tuple[int, ...],
-    decoding: str = "leave_one_out",
-):
-    """ProteinMPNN decoder state before ``W_out``, ``[B, 1, L, D]``.
+def _mpnn_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
+    """ProteinMPNN decoder state before ``W_out``, ``[B, 1, L, D]``, leave-one-out.
 
     The encoder sees the backbone only; the sequence enters through the decoder, so the
     result depends on both. ``layers`` is ignored (single output).
 
-    ``left_to_right``: one pass in index order; position ``i`` sees residues ``< i``.
-    ``leave_one_out``: one pass per position ``i``, where ``i`` sees every other residue
-    (the others decoded in index order) and only row ``i`` of that pass is kept.
+    One decoder pass per position ``i``: ``i`` sees the identity of every other residue
+    (the others decoded in index order, ``i`` last, as ``conditional_probs`` does) and
+    never its own. Only row ``i`` of pass ``i`` is kept. Every position therefore gets
+    the same amount of sequence context, at the cost of L passes.
     """
     h_V_enc, h_E, E_idx = _mpnn_encode(backbone, inputs)
     B, L = inputs["S"].shape
-    device = h_V_enc.device
-    earlier = torch.tril(torch.ones(L, L, device=device), diagonal=-1)
-
-    if decoding == "left_to_right":
-        visible = earlier.expand(B, L, L)
-        return _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, visible).unsqueeze(1)
-    if decoding != "leave_one_out":
-        raise ValueError(f"decoding must be one of {_MPNN_DECODINGS}, got {decoding!r}")
+    earlier = torch.tril(torch.ones(L, L, device=h_V_enc.device), diagonal=-1)
 
     out = torch.zeros_like(h_V_enc)
     for i in range(L):
