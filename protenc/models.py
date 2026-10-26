@@ -36,10 +36,17 @@ from protenc.esmc_loading import (
 )
 
 try:
-    from .mpnn import ProteinMPNN, gather_nodes, parse_PDB, tied_featurize
+    from .mpnn import (
+        ProteinMPNN,
+        cat_neighbors_nodes,
+        gather_nodes,
+        parse_PDB,
+        tied_featurize,
+    )
 except ImportError:
     from mpnn import (  # pyright: ignore[reportMissingImports]
         ProteinMPNN,
+        cat_neighbors_nodes,
         gather_nodes,
         parse_PDB,
         tied_featurize,
@@ -992,9 +999,17 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
     structure_aware = True
 
     def __init__(
-        self, model_name: str, ca_only: bool = False, use_structure: bool = True
+        self,
+        model_name: str,
+        ca_only: bool = False,
+        use_structure: bool = True,
+        decoding: str = "leave_one_out",
     ):
         super().__init__()
+        if decoding not in _MPNN_DECODINGS:
+            raise ValueError(
+                f"decoding must be one of {_MPNN_DECODINGS}, got {decoding!r}"
+            )
         print(f"Initializing ProteinMPNN embedding model with model name: {model_name}")
 
         cache_dir = torch.hub.get_dir()
@@ -1008,7 +1023,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         self.model = ProteinMPNN.from_pretrained(model_name, ca_only=ca_only)
         self.model.eval()
         self.ca_only = ca_only
-        self._set_core(_mpnn_core)
+        self._set_core(_mpnn_core, decoding=decoding)
 
     def prepare_sequences(self, sequences, structures=None):
         """
@@ -1121,25 +1136,86 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
 
 
 _MPNN_CORE_KEYS = ("X", "S", "mask", "residue_idx", "chain_encoding_all")
+_MPNN_DECODINGS = ("leave_one_out", "left_to_right")
 
 
-def _mpnn_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
-    """ProteinMPNN encoder output ``[B, 1, L, D]``; ``layers`` is ignored (single output)."""
-    X, S, mask = inputs["X"], inputs["S"], inputs["mask"]
+def _mpnn_encode(backbone: nn.Module, inputs: dict):
+    """Structure-only encoder, as in ``ProteinMPNN.forward``: nodes start at zero."""
+    mask = inputs["mask"]
     E, E_idx = backbone.features(
-        X, mask, inputs["residue_idx"], inputs["chain_encoding_all"]
+        inputs["X"], mask, inputs["residue_idx"], inputs["chain_encoding_all"]
     )
-    h_V = backbone.W_s(S).clone()
+    h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
     h_E = backbone.W_e(E)
 
-    # Masking for attention (gather_nodes is used both in mpnn.py and here)
     mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
     mask_attend = mask.unsqueeze(-1) * mask_attend
-
-    # Pass through encoder layers (exact order/inputs as in mpnn.py)
     for layer in backbone.encoder_layers:
         h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
-    return h_V.unsqueeze(1)
+    return h_V, h_E, E_idx
+
+
+def _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, visible):
+    """Decoder node states with the sequence teacher-forced.
+
+    ``visible[b, q, p]`` is 1 where position ``p`` is decoded before position ``q``,
+    i.e. where ``q`` may see the identity of ``p`` (``order_mask_backward`` upstream).
+    """
+    mask = inputs["mask"]
+    h_S = backbone.W_s(inputs["S"])
+    h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
+    h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+    h_EXV_encoder = cat_neighbors_nodes(h_V_enc, h_EX_encoder, E_idx)
+
+    mask_attend = torch.gather(visible, 2, E_idx).unsqueeze(-1)
+    mask_1D = mask.view([mask.size(0), mask.size(1), 1, 1])
+    mask_bw = mask_1D * mask_attend
+    mask_fw = mask_1D * (1.0 - mask_attend)
+    h_EXV_encoder_fw = mask_fw * h_EXV_encoder
+
+    h_V = h_V_enc
+    for layer in backbone.decoder_layers:
+        h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
+        h_ESV = mask_bw * h_ESV + h_EXV_encoder_fw
+        h_V = layer(h_V, h_ESV, mask)
+    return h_V
+
+
+def _mpnn_core(
+    backbone: nn.Module,
+    inputs: dict,
+    layers: tuple[int, ...],
+    decoding: str = "leave_one_out",
+):
+    """ProteinMPNN decoder state before ``W_out``, ``[B, 1, L, D]``.
+
+    The encoder sees the backbone only; the sequence enters through the decoder, so the
+    result depends on both. ``layers`` is ignored (single output).
+
+    ``left_to_right``: one pass in index order; position ``i`` sees residues ``< i``.
+    ``leave_one_out``: one pass per position ``i``, where ``i`` sees every other residue
+    (the others decoded in index order) and only row ``i`` of that pass is kept.
+    """
+    h_V_enc, h_E, E_idx = _mpnn_encode(backbone, inputs)
+    B, L = inputs["S"].shape
+    device = h_V_enc.device
+    earlier = torch.tril(torch.ones(L, L, device=device), diagonal=-1)
+
+    if decoding == "left_to_right":
+        visible = earlier.expand(B, L, L)
+        return _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, visible).unsqueeze(1)
+    if decoding != "leave_one_out":
+        raise ValueError(f"decoding must be one of {_MPNN_DECODINGS}, got {decoding!r}")
+
+    out = torch.zeros_like(h_V_enc)
+    for i in range(L):
+        vis = earlier.clone()
+        vis[:, i] = 0.0
+        vis[i, :] = 1.0
+        vis[i, i] = 0.0
+        h_V = _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, vis.expand(B, L, L))
+        out[:, i] = h_V[:, i]
+    return out.unsqueeze(1)
 
 
 @dataclass
