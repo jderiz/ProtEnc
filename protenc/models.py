@@ -220,6 +220,14 @@ class EmbeddingType(Enum):
     PER_PROTEIN = "per_protein"
 
 
+class StructureInput(Enum):
+    """Whether a model takes backbone structures alongside the sequences."""
+
+    NONE = "none"
+    OPTIONAL = "optional"
+    REQUIRED = "required"
+
+
 class _HiddenCore(nn.Module):
     """
     DataParallel-safe compute core of an embedder.
@@ -243,6 +251,8 @@ class _HiddenCore(nn.Module):
 
 class BaseProteinEmbeddingModel(nn.Module):
     embedding_type: EmbeddingType
+    # What the model needs besides sequences; advertised by ``ProteinEncoder.requirements``.
+    structure_input: StructureInput = StructureInput.NONE
     # Default: no explicit chain break token. Specific models may override.
     chain_break_token: str = ""
     # Layers to extract in the multi-layer path; set by get_model when configured.
@@ -250,6 +260,10 @@ class BaseProteinEmbeddingModel(nn.Module):
     # Implemented by subclasses that support multi-layer extraction (type-only
     # declaration; no runtime attribute is created here).
     forward_multi: Callable[..., Any]
+
+    @property
+    def structure_aware(self) -> bool:
+        return self.structure_input is not StructureInput.NONE
 
     def prepare_sequences(self, sequences, structures=None) -> Any:
         return NotImplementedError
@@ -389,7 +403,6 @@ class BaseProtTransEmbeddingModel(BaseProteinEmbeddingModel):
 
 class ProtBERTEmbeddingModel(BaseProtTransEmbeddingModel):
     available_models = ["prot_bert", "prot_bert_bfd"]
-    structure_aware = False
 
     def __init__(
         self, model_name: str, load_weights: bool = True, repr_layer: int | None = None
@@ -419,7 +432,6 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
         "prot_t5_xxl_uniref50",
         "prot_t5_xxl_bfd",
     ]
-    structure_aware = False
 
     def __init__(
         self, model_name: str, load_weights: bool = True, repr_layer: int | None = None
@@ -444,7 +456,6 @@ class ProtT5EmbeddingModel(BaseProtTransEmbeddingModel):
 
 class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
-    structure_aware = False
     # ESM2-style models in HAIPR use "<eos>" as chain break token.
     chain_break_token: str = "<eos>"
 
@@ -528,7 +539,7 @@ class ESM3EmbeddingModel(BaseProteinEmbeddingModel):
     """ESM3 embedder; batches must contain sequences of the same length (no padding)."""
 
     embedding_kind = EmbeddingType.PER_RESIDUE
-    structure_aware = True
+    structure_input = StructureInput.OPTIONAL
     requires_same_length_batch = True
     # ProtEnc ESM3 expects "|" as the multi-chain separator.
     chain_break_token: str = "|"
@@ -874,7 +885,6 @@ def _esm3_core(
 
 class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
-    structure_aware = False
     chain_break_token: str = "|"
 
     def __init__(
@@ -927,7 +937,6 @@ class ESMCEmbeddingModel(BaseProteinEmbeddingModel):
 
 class CarpEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_PROTEIN
-    structure_aware = False
     # CARP's PROTEIN_ALPHABET is "ACDEFGHIKLMNPQRSTVWYBZXJOU*-#@" and holds no
     # chain-break character: sequence_models defines SEP as "/", but only inside
     # MSA_ALPHABET_PLUS, so the collater raises KeyError on the canonical "|".
@@ -996,7 +1005,9 @@ class CarpEmbeddingModel(BaseProteinEmbeddingModel):
 
 class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
     embedding_kind = EmbeddingType.PER_RESIDUE
-    structure_aware = True
+    structure_input = StructureInput.REQUIRED
+    # One backbone per batch, so every sequence has to match its length.
+    requires_same_length_batch = True
 
     def __init__(
         self,
@@ -1226,9 +1237,11 @@ class ModelCard:
     init_fn: Callable[[], BaseProteinEmbeddingModel]
     num_layers: int | None = None
     supports_repr_layer: bool = True
+    structure_input: StructureInput = StructureInput.NONE
 
     @classmethod
     def from_model_cls(cls, *, model_cls, model_kwargs, **kwargs):
+        kwargs.setdefault("structure_input", model_cls.structure_input)
         def init_fn(**init_kwargs):
             return model_cls(**{**model_kwargs, **init_kwargs})
 
@@ -1409,6 +1422,7 @@ def get_model_info(model_name: str):
         "num_layers": model_desc.num_layers,
         "default_repr_layer": model_desc.num_layers,
         "supports_repr_layer": model_desc.supports_repr_layer,
+        "structure_input": model_desc.structure_input.value,
     }
 
 

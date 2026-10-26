@@ -7,6 +7,8 @@ import torch
 
 from protenc.models import get_model_info, list_models
 
+from .fixtures import write_backbone_pdb
+
 
 def skip_no_gpu(fn):
     sig = inspect.signature(fn)
@@ -63,3 +65,21 @@ def list_models_to_test(max_embed_dim=512):
         for model_name in list_models()
         if get_model_info(model_name)["embed_dim"] <= max_embed_dim
     ]
+
+
+def model_inputs(model_name, proteins, tmp_path):
+    """Return ``(proteins, structures)`` that satisfy what the model needs.
+
+    A model that requires structures gets point mutants of the first protein, all on
+    one generated backbone, because a batch shares a single structure and every
+    sequence has to match its length.
+    """
+    if get_model_info(model_name)["structure_input"] != "required":
+        return list(proteins), None
+
+    base = proteins[0]
+    variants = [base]
+    for pos in (3, 7):
+        sub = "A" if base[pos] != "A" else "G"
+        variants.append(base[:pos] + sub + base[pos + 1 :])
+    return variants, write_backbone_pdb(tmp_path / "backbone.pdb", len(base))

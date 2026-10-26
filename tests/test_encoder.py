@@ -4,7 +4,7 @@ import torch
 from protenc.encoder import get_encoder
 from protenc.models import get_model, get_model_info
 
-from .utils import list_models_to_test, skip_large_models, skip_no_gpu
+from .utils import list_models_to_test, model_inputs, skip_large_models, skip_no_gpu
 
 
 @pytest.mark.parametrize("model_name", list_models_to_test())
@@ -26,11 +26,12 @@ def test_get_encoder(model_name, device):
 @skip_large_models(max_embed_dim=1280)
 @pytest.mark.parametrize("model_name", list_models_to_test())
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_encode(proteins, model_name, device):
+def test_encode(proteins, model_name, device, tmp_path):
     model_info = get_model_info(model_name)
     encoder = get_encoder(model_name, device=device)
+    proteins, structures = model_inputs(model_name, proteins, tmp_path)
 
-    for idx, embed in encoder(proteins, average_sequence=False):
+    for idx, embed in encoder(proteins, structures=structures, average_sequence=False):
         assert len(proteins[idx]) == len(embed)
         assert embed.shape[-1] == model_info["embed_dim"]
 
@@ -61,10 +62,14 @@ def test_encode_list_yields_index_embed_tuples():
 @skip_large_models(max_embed_dim=1280)
 @pytest.mark.parametrize("model_name", list_models_to_test())
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_encode_dict(protein_dict, model_name, device):
+def test_encode_dict(protein_dict, model_name, device, tmp_path):
     model_info = get_model_info(model_name)
     encoder = get_encoder(model_name, device=device)
+    seqs, structures = model_inputs(model_name, list(protein_dict.values()), tmp_path)
+    protein_dict = {f"prot{i}": seq for i, seq in enumerate(seqs)}
 
-    for prot_id, embed in encoder(protein_dict, average_sequence=False):
+    for prot_id, embed in encoder(
+        protein_dict, structures=structures, average_sequence=False
+    ):
         assert len(protein_dict[prot_id]) == len(embed)
         assert embed.shape[-1] == model_info["embed_dim"]

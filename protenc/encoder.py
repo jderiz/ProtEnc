@@ -1,5 +1,6 @@
 import warnings
 from collections.abc import Mapping
+from dataclasses import dataclass
 from functools import cached_property
 
 import torch
@@ -7,8 +8,22 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import protenc.utils as utils
-from protenc.models import BaseProteinEmbeddingModel, EmbeddingType, get_model
+from protenc.models import (
+    BaseProteinEmbeddingModel,
+    EmbeddingType,
+    StructureInput,
+    get_model,
+)
 from protenc.types import BatchSize, ProteinEncoderInput, ReturnFormat
+
+
+@dataclass(frozen=True)
+class EncoderRequirements:
+    """What an encoder needs besides the sequences themselves."""
+
+    structure: StructureInput = StructureInput.NONE
+    # Sequences in one batch share a length (for structure models: the structure's).
+    same_length_sequences: bool = False
 
 
 class ProteinEncoder:
@@ -83,6 +98,25 @@ class ProteinEncoder:
                     f"batch_size={self.batch_size} is smaller than the number of GPUs "
                     f"({len(self.device_ids)}); some GPUs will be idle."
                 )
+
+    @property
+    def requirements(self) -> EncoderRequirements:
+        """What the wrapped model needs: inputs to pass to ``encode``."""
+        return EncoderRequirements(
+            structure=getattr(self.model, "structure_input", StructureInput.NONE),
+            same_length_sequences=self._same_length_batch,
+        )
+
+    def _check_requirements(self, structures) -> None:
+        if (
+            self.requirements.structure is StructureInput.REQUIRED
+            and structures is None
+        ):
+            raise ValueError(
+                f"{type(self.model).__name__} requires structures: pass the "
+                "structure file path(s) via `structures`. Check "
+                "`encoder.requirements` for what a model needs."
+            )
 
     @cached_property
     def device(self):
@@ -252,6 +286,7 @@ class ProteinEncoder:
         Flow for all models: 1) prepare_sequences (tokenization), 2) batch-wise forward.
         Yields (index, embed) so the consumer can write to disk by index (streamed).
         """
+        self._check_requirements(structures)
         target_device = self._get_primary_device()
         yield from self._encode_two_phase(
             proteins,
@@ -372,6 +407,7 @@ class ProteinEncoder:
         own writer. Prepares and encodes one batch at a time without retaining
         all prepared tensors in memory.
         """
+        self._check_requirements(structures)
         target_device = self._get_primary_device()
         n = len(proteins)
 
