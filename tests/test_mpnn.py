@@ -1,11 +1,9 @@
 import numpy as np
 import pytest
 import torch
-import torch.nn.functional as F
 
-from protenc import models
 from protenc.mpnn import ProteinMPNN
-from protenc.models import ProteinMPNNEmbeddingModel, _mpnn_core, _mpnn_encode
+from protenc.models import ProteinMPNNEmbeddingModel, _mpnn_encode
 
 from .fixtures import write_backbone_pdb
 
@@ -62,28 +60,14 @@ class TestMpnnEmbedding:
         assert emb.shape == (2, L, 128)
         assert not torch.allclose(emb[0], emb[1])
 
-    def test_matches_upstream_conditional_probs(self, monkeypatch, pdb, sequences):
-        model, net = _build(monkeypatch)
-        batch = model.prepare_sequences([sequences[0]], pdb)
-        ours = _mpnn_core(net, batch, (0,))[:, 0]
-        # Increasing randn puts the other positions in index order and the target last.
-        upstream = net.conditional_probs(
-            batch["X"],
-            batch["S"],
-            batch["mask"],
-            torch.ones(1, L),
-            batch["residue_idx"],
-            batch["chain_encoding_all"],
-            torch.arange(1, L + 1).float()[None] / L,
-        )
-        assert torch.allclose(
-            F.log_softmax(net.W_out(ours), dim=-1), upstream, atol=1e-5
-        )
-
-    def test_masks_only_the_residue_itself(self, monkeypatch, pdb, sequences):
+    def test_mutated_position_sees_its_own_residue(self, monkeypatch, pdb, sequences):
         model, _ = _build(monkeypatch)
         emb = _embed(model, list(sequences), pdb)
         # The sequences differ only at position 5.
-        assert torch.allclose(emb[0, 5], emb[1, 5], atol=1e-6)
-        others = [i for i in range(L) if i != 5]
-        assert not torch.allclose(emb[0, others], emb[1, others])
+        assert not torch.allclose(emb[0, 5], emb[1, 5])
+
+    def test_batching_does_not_change_the_embedding(self, monkeypatch, pdb, sequences):
+        model, _ = _build(monkeypatch)
+        together = _embed(model, list(sequences), pdb)
+        alone = torch.cat([_embed(model, [seq], pdb) for seq in sequences])
+        assert torch.allclose(together, alone, atol=1e-5)

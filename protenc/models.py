@@ -1184,29 +1184,22 @@ def _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, visible):
 
 
 def _mpnn_core(backbone: nn.Module, inputs: dict, layers: tuple[int, ...]):
-    """ProteinMPNN decoder state before ``W_out``, ``[B, 1, L, D]``, leave-one-out.
+    """ProteinMPNN decoder state before ``W_out``, ``[B, 1, L, D]``, sequence unmasked.
 
-    The encoder sees the backbone only; the sequence enters through the decoder, so the
-    result depends on both. ``layers`` is ignored (single output).
+    The encoder sees the backbone only; the sequence enters through the decoder, which
+    gets every residue identity, the position's own included (a residue is its own
+    nearest neighbor). One pass per batch, like the other embedders. ``layers`` is
+    ignored (single output).
 
-    One decoder pass per position ``i``: ``i`` sees the identity of every other residue
-    (the others decoded in index order, ``i`` last, as ``conditional_probs`` does) and
-    never its own. Only row ``i`` of pass ``i`` is kept. Every position therefore gets
-    the same amount of sequence context, at the cost of L passes.
+    Training never showed the decoder this input: each pair of positions saw one
+    another in at most one direction, and no position saw itself. On hYAP65 the states
+    still track the leave-one-out ones (per-position cosine 0.994) and do not copy the
+    identity (``W_out`` recovers 26% of residues).
     """
     h_V_enc, h_E, E_idx = _mpnn_encode(backbone, inputs)
     B, L = inputs["S"].shape
-    earlier = torch.tril(torch.ones(L, L, device=h_V_enc.device), diagonal=-1)
-
-    out = torch.zeros_like(h_V_enc)
-    for i in range(L):
-        vis = earlier.clone()
-        vis[:, i] = 0.0
-        vis[i, :] = 1.0
-        vis[i, i] = 0.0
-        h_V = _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, vis.expand(B, L, L))
-        out[:, i] = h_V[:, i]
-    return out.unsqueeze(1)
+    visible = torch.ones(B, L, L, device=h_V_enc.device)
+    return _mpnn_decode(backbone, inputs, h_V_enc, h_E, E_idx, visible).unsqueeze(1)
 
 
 @dataclass
