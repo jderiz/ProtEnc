@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, Callable, List, Optional
 
 import colorlog as logging
+import numpy as np
 import torch
 import torch.nn as nn
 from esm.models.esm3 import ESM3
@@ -1028,16 +1029,25 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         self.ca_only = ca_only
         self._set_core(_mpnn_core)
 
-    def prepare_sequences(self, sequences, structures=None):
+    def prepare_sequences(
+        self, sequences, structures=None, chain_list=None, structure_id=None
+    ):
         """
         Prepare sequences and structures for ProteinMPNN embedding.
 
         Args:
-            sequences: List of protein sequences
+            sequences: List of protein sequences. Chains are separated by ``|`` and
+                follow ``chain_list`` (or the parser's chain order without it). Each
+                chain has one character per residue present in the structure.
             structures: PDB file path (string) or list of PDB file paths (required)
+            chain_list: Chains to use, in the order of the sequences. ``None`` takes
+                every chain in the file.
+            structure_id: Unused; accepted so callers can pass it to any embedder.
 
         Returns:
-            Dictionary containing featurized inputs ready for forward pass
+            Dictionary containing featurized inputs ready for forward pass. ``keep``
+            holds, per sample, the rows of the padded layout that are residues: the
+            parser's filler rows for missing residue numbers are left out.
         """
         logger.debug(f"Preparing {len(sequences)} sequences for ProteinMPNN")
         if structures is None:
@@ -1049,54 +1059,32 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
 
         device = next(self.model.parameters()).device
 
-        if isinstance(structures, str):
-            pdb_dict_list = parse_PDB(structures, ca_only=self.ca_only)
-        else:
-            # List of PDB paths: use first for structure, batch from all if no sequences
-            pdb_dict_list = (
-                parse_PDB(structures[0], ca_only=self.ca_only) if structures else []
-            )
+        first_pdb = structures if isinstance(structures, str) else structures[0]
+        pdb_dict_list = parse_PDB(
+            first_pdb, input_chain_list=chain_list, ca_only=self.ca_only
+        )
         logger.debug(f"pdb_dict_list: {len(pdb_dict_list)}")
         if not pdb_dict_list:
-            raise ValueError(
-                f"Failed to parse PDB file: {structures if isinstance(structures, str) else structures[0] if structures else None}"
-            )
+            raise ValueError(f"Failed to parse PDB file: {first_pdb}")
 
         pdb_dict = pdb_dict_list[0]
-        pdb_seq_len = len(pdb_dict.get("seq", ""))
-
-        chain_keys = [key for key in pdb_dict.keys() if key.startswith("seq_chain_")]
-        chain_letters = [key.replace("seq_chain_", "") for key in chain_keys]
+        layout = _mpnn_chain_layout(pdb_dict)
 
         if sequences:
-            if not all(len(seq) == pdb_seq_len for seq in sequences):
-                raise ValueError(
-                    f"All sequences ({len(sequences[0])}) must have the same length as PDB structure ({pdb_seq_len})"
-                )
-            batch = []
-            for seq in sequences:
-                seq_dict = pdb_dict.copy()
-                seq_dict["seq"] = seq
-                if len(chain_letters) == 1:
-                    seq_dict[f"seq_chain_{chain_letters[0]}"] = seq
-                else:
-                    start_idx = 0
-                    for letter in chain_letters:
-                        chain_key = f"seq_chain_{letter}"
-                        if chain_key in pdb_dict:
-                            chain_len = len(pdb_dict[chain_key])
-                            seq_dict[chain_key] = seq[start_idx : start_idx + chain_len]
-                            start_idx += chain_len
-                batch.append(seq_dict)
+            batch = [_mpnn_threaded(pdb_dict, layout, seq) for seq in sequences]
+            layouts = [layout] * len(batch)
         elif not isinstance(structures, str) and structures:
-            batch = []
+            batch, layouts = [], []
             for pdb_path in structures:
-                pl = parse_PDB(pdb_path, ca_only=self.ca_only)
+                pl = parse_PDB(
+                    pdb_path, input_chain_list=chain_list, ca_only=self.ca_only
+                )
                 if not pl:
                     raise ValueError(f"Failed to parse PDB file: {pdb_path}")
                 batch.append(pl[0])
+                layouts.append(_mpnn_chain_layout(pl[0]))
         else:
-            batch = [pdb_dict]
+            batch, layouts = [pdb_dict], [layout]
 
         featurized = tied_featurize(
             batch,
@@ -1117,7 +1105,7 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
             "chain_M": featurized[4],
             "residue_idx": featurized[12],
             "chain_encoding_all": featurized[5],
-            "lengths": featurized[3],
+            "keep": [torch.as_tensor(lay["keep"]) for lay in layouts],
         }
 
     @torch.no_grad()
@@ -1133,12 +1121,77 @@ class ProteinMPNNEmbeddingModel(BaseProteinEmbeddingModel):
         """
         core_inputs = {k: input[k] for k in _MPNN_CORE_KEYS}
         h_V = self._run_core(core_inputs, (0,))
-        # ``lengths`` stays out of the core: it is not a batch-first tensor to scatter.
-        for i, seq_len in enumerate(input["lengths"]):
-            yield h_V[i, 0, :seq_len].cpu()
+        # ``keep`` stays out of the core: it is not a batch-first tensor to scatter.
+        for i, keep in enumerate(input["keep"]):
+            yield h_V[i, 0][keep.to(h_V.device)].cpu()
 
 
 _MPNN_CORE_KEYS = ("X", "S", "mask", "residue_idx", "chain_encoding_all")
+
+
+def _mpnn_chain_layout(pdb_dict: dict) -> dict:
+    """Which rows of a parsed PDB are residues, and where they land in the batch.
+
+    ``parse_PDB_biounits`` adds an all-NaN filler row (``-``) for every missing residue
+    number. Upstream keeps them so ``residue_idx`` spacing shows the numbering gap, and
+    so does this wrapper, but they are not residues: sequences built from the structure
+    (haipr, ESM3) do not count them. ``present`` lists the real rows per chain, in
+    parse order; ``keep`` gives the same rows in ``tied_featurize``'s layout, which sorts
+    chains alphabetically, ordered like ``letters``.
+    """
+    letters = [k[len("seq_chain_") :] for k in pdb_dict if k.startswith("seq_chain_")]
+    present = {}
+    for letter in letters:
+        seq = pdb_dict[f"seq_chain_{letter}"]
+        ca = np.asarray(pdb_dict[f"coords_chain_{letter}"][f"CA_chain_{letter}"], float)
+        no_coords = np.isnan(ca.reshape(len(seq), -1)).all(axis=1)
+        filler = np.array([c == "-" for c in seq], dtype=bool) & no_coords
+        present[letter] = np.flatnonzero(~filler)
+    offset, start = {}, 0
+    for letter in sorted(letters):
+        offset[letter] = start
+        start += len(pdb_dict[f"seq_chain_{letter}"])
+    keep = np.concatenate([offset[letter] + present[letter] for letter in letters])
+    return {"letters": letters, "present": present, "keep": keep}
+
+
+def _mpnn_threaded(pdb_dict: dict, layout: dict, seq: str) -> dict:
+    """Copy of ``pdb_dict`` carrying ``seq``: one character per present residue.
+
+    Chains are separated by ``|`` and follow ``layout["letters"]``. Without a
+    separator the sequence is cut into consecutive per-chain pieces. Filler rows get
+    ``X``.
+    """
+    letters, present = layout["letters"], layout["present"]
+    counts = [len(present[letter]) for letter in letters]
+    parts = seq.split("|")
+    if len(parts) == 1 and len(letters) > 1:
+        if len(seq) != sum(counts):
+            raise ValueError(
+                f"Sequence has {len(seq)} residues but the structure has "
+                f"{sum(counts)} across chains {letters} ({dict(zip(letters, counts))})"
+            )
+        cuts = np.cumsum([0] + counts)
+        parts = [seq[cuts[i] : cuts[i + 1]] for i in range(len(letters))]
+    elif len(parts) != len(letters):
+        raise ValueError(
+            f"Sequence has {len(parts)} chain segments but the structure has "
+            f"{len(letters)} chains {letters}"
+        )
+
+    out = pdb_dict.copy()
+    for letter, part, count in zip(letters, parts, counts):
+        if len(part) != count:
+            raise ValueError(
+                f"Chain {letter}: sequence has {len(part)} residues but the "
+                f"structure has {count} (numbering gaps excluded)"
+            )
+        rows = ["X"] * len(pdb_dict[f"seq_chain_{letter}"])
+        for row, char in zip(present[letter], part):
+            rows[row] = char
+        out[f"seq_chain_{letter}"] = "".join(rows)
+    out["seq"] = "".join(out[f"seq_chain_{letter}"] for letter in letters)
+    return out
 
 
 def _mpnn_encode(backbone: nn.Module, inputs: dict):
@@ -1215,6 +1268,7 @@ class ModelCard:
     @classmethod
     def from_model_cls(cls, *, model_cls, model_kwargs, **kwargs):
         kwargs.setdefault("structure_input", model_cls.structure_input)
+
         def init_fn(**init_kwargs):
             return model_cls(**{**model_kwargs, **init_kwargs})
 
