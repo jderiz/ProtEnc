@@ -5,6 +5,7 @@ ProtEnc: generate protein embeddings the easy way
 * [ProtTrans](https://github.com/agemagician/ProtTrans) family
 * [ESM](https://github.com/facebookresearch/esm)
 * [CARP](https://github.com/microsoft/protein-sequence-models)
+* [SaProt](https://github.com/westlake-repl/SaProt): `saprot_35m`, `saprot_650m`, `saprot_650m_pdb`, `saprot_1_3b`. Structure is optional. Without it every Foldseek 3Di state is masked (`#`); pass `structures=<pdb/cif>` (and `chain_list`) to compute the states with `mini3di`.
 
 Usage
 -----

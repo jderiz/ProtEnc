@@ -35,6 +35,9 @@ from protenc.esmc_loading import (
     load_esmc,
     tokenize_esmc_sequences,
 )
+from protenc.saprot import chain_states as saprot_chain_states
+from protenc.saprot import combine as saprot_combine
+from protenc.saprot import sequence_only as saprot_sequence_only
 
 try:
     from .mpnn import (
@@ -501,6 +504,102 @@ class ESMEmbeddingModel(BaseProteinEmbeddingModel):
     @torch.no_grad()
     def forward_multi(self, input, repr_layers: list[int]):
         logger.debug(f"Input: {input}")
+        hidden = self._run_core(input, repr_layers)
+        seq_lengths = input["attention_mask"].sum(1)
+
+        for i, seq_len in enumerate(seq_lengths):
+            for j, layer in enumerate(repr_layers):
+                yield i, layer, hidden[i, j, 1 : seq_len - 1]
+
+
+class SaProtEmbeddingModel(BaseProteinEmbeddingModel):
+    """SaProt: an ESM2-architecture model over residue + Foldseek 3Di tokens.
+
+    Without structures every 3Di slot is ``#`` (masked); with a structure file the
+    states are computed by ``mini3di``. See ``protenc.saprot``.
+    """
+
+    embedding_kind = EmbeddingType.PER_RESIDUE
+    structure_input = StructureInput.OPTIONAL
+    # Same ESM2 vocabulary and special tokens as ESMEmbeddingModel.
+    chain_break_token: str = "<eos>"
+
+    def __init__(
+        self,
+        model_name: str,
+        num_layers: int,
+        repr_layer: int | None = None,
+        plddt_mask: bool = False,
+    ):
+        super().__init__()
+        self.repr_layer = resolve_repr_layer(repr_layer, num_layers)
+        validate_repr_layer(self.repr_layer, num_layers, model_name=model_name)
+        self.plddt_mask = plddt_mask
+
+        self.model = EsmModel.from_pretrained(model_name, add_pooling_layer=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        self.model.eval()
+        _assert_hf_num_hidden_layers(self.model, num_layers, model_name=model_name)
+        self._set_core(_hf_core)
+
+    def prepare_sequences(
+        self, sequences, structures=None, chain_list=None, structure_id=None
+    ):
+        """
+        Tokenize ``sequences`` as SaProt residue + 3Di tokens.
+
+        Args:
+            sequences: Amino-acid sequences; chains separated by ``|`` or ``<eos>``.
+            structures: PDB/mmCIF path (string or single-element list) to take the
+                3Di states from. ``None`` masks every state.
+            chain_list: Chains of the structure, in the order of the sequence's
+                chains. ``None`` takes every chain in file order.
+            structure_id: Unused; accepted so callers can pass it to any embedder.
+
+        With a structure, each chain must have one residue per CA-bearing residue
+        of the structure's chain.
+        """
+        brk = self.chain_break_token
+        sequences = [s.replace("|", brk) for s in sequences]
+        path = structures if isinstance(structures, str) else None
+        if path is None and structures:
+            path = structures[0]
+
+        if path is None:
+            tokens = [
+                brk.join(saprot_sequence_only(c) for c in s.split(brk))
+                for s in sequences
+            ]
+        else:
+            states = saprot_chain_states(path, chain_list, self.plddt_mask)
+            tokens = []
+            for s in sequences:
+                chains = s.split(brk)
+                if len(chains) != len(states) or any(
+                    len(c) != len(st) for c, st in zip(chains, states)
+                ):
+                    raise ValueError(
+                        f"Sequence chains {[len(c) for c in chains]} do not match the "
+                        f"structure's chains {[len(st) for st in states]} in {path}"
+                    )
+                tokens.append(
+                    brk.join(saprot_combine(c, st) for c, st in zip(chains, states))
+                )
+        return self.tokenizer(
+            tokens, return_tensors="pt", add_special_tokens=True, padding=True
+        )
+
+    @torch.no_grad()
+    def forward(self, input):
+        hidden = self._run_core(input, (self.repr_layer,))
+        seq_lengths = input["attention_mask"].sum(1)
+
+        for i, seq_len in enumerate(seq_lengths):
+            yield hidden[i, 0, 1 : seq_len - 1]
+
+    @torch.no_grad()
+    def forward_multi(self, input, repr_layers: list[int]):
         hidden = self._run_core(input, repr_layers)
         seq_lengths = input["attention_mask"].sum(1)
 
@@ -1405,6 +1504,40 @@ model_descriptions = [
         num_layers=48,
         model_cls=ESM3EmbeddingModel,
         model_kwargs=dict(model_name="esm3_sm_open_v1", use_norm_layer=True),
+    ),
+    ModelCard.from_model_cls(
+        name="saprot_35m",
+        family="SaProt",
+        embed_dim=480,
+        num_layers=12,
+        model_cls=SaProtEmbeddingModel,
+        model_kwargs=dict(model_name="westlake-repl/SaProt_35M_AF2", num_layers=12),
+    ),
+    ModelCard.from_model_cls(
+        name="saprot_650m",
+        family="SaProt",
+        embed_dim=1280,
+        num_layers=33,
+        model_cls=SaProtEmbeddingModel,
+        model_kwargs=dict(model_name="westlake-repl/SaProt_650M_AF2", num_layers=33),
+    ),
+    ModelCard.from_model_cls(
+        name="saprot_650m_pdb",
+        family="SaProt",
+        embed_dim=1280,
+        num_layers=33,
+        model_cls=SaProtEmbeddingModel,
+        model_kwargs=dict(model_name="westlake-repl/SaProt_650M_PDB", num_layers=33),
+    ),
+    ModelCard.from_model_cls(
+        name="saprot_1_3b",
+        family="SaProt",
+        embed_dim=1280,
+        num_layers=66,
+        model_cls=SaProtEmbeddingModel,
+        model_kwargs=dict(
+            model_name="westlake-repl/SaProt_1.3B_AFDB_OMG_NCBI", num_layers=66
+        ),
     ),
     ModelCard.from_model_cls(
         name="mpnn",
