@@ -15,6 +15,10 @@ class TestTokens:
     def test_combine_interleaves_residues_and_states(self):
         assert combine("MEV", "#vp") == "M#EvVp"
 
+    def test_nonstandard_residues_are_masked_outright(self):
+        assert sequence_only("MXB") == "M#" + "##" + "##"
+        assert combine("MXV", "vpl") == "Mv" + "##" + "Vl"
+
     def test_combine_rejects_a_length_mismatch(self):
         with pytest.raises(ValueError, match="3 residues but 2"):
             combine("MEV", "#v")
@@ -89,6 +93,11 @@ class TestEmbedding:
         embeds = _embed(saprot_35m, proteins[:2])
         for prot, embed in zip(proteins, embeds):
             assert embed.shape == (len(prot), 480)
+
+    def test_runs_of_unknown_residues_keep_one_row_each(self, saprot_35m):
+        seq = "TVXXSSTKGPSVFPLAPXXXXXXGG"
+        (embed,) = _embed(saprot_35m, [seq])
+        assert embed.shape == (len(seq), 480)
 
     def test_padding_does_not_change_an_embedding(self, saprot_35m, proteins):
         alone = _embed(saprot_35m, [proteins[0]])[0]

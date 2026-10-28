@@ -11,15 +11,23 @@ from pathlib import Path
 import numpy as np
 
 MASK_3DI = "#"
+# The vocabulary only holds these residues. Anything else ("X", "B", "U", ...) is
+# masked as "##": an out-of-vocabulary pair such as "X#" is not one token, and a run of
+# them is merged into a single unknown token, which drops rows from the embedding.
+STANDARD_RESIDUES = frozenset("ACDEFGHIKLMNPQRSTVWY")
 # SaProt masks the 3Di state of AlphaFold residues below this pLDDT.
 PLDDT_THRESHOLD = 70.0
 
 _encoder = None
 
 
+def _residue(aa: str) -> str:
+    return aa if aa in STANDARD_RESIDUES else MASK_3DI
+
+
 def sequence_only(sequence: str) -> str:
-    """``"MKV"`` -> ``"M#K#V#"``."""
-    return "".join(f"{aa}{MASK_3DI}" for aa in sequence.upper())
+    """``"MKV"`` -> ``"M#K#V#"``; residues outside the vocabulary become ``"##"``."""
+    return "".join(f"{_residue(aa)}{MASK_3DI}" for aa in sequence.upper())
 
 
 def combine(sequence: str, states: str) -> str:
@@ -28,7 +36,10 @@ def combine(sequence: str, states: str) -> str:
         raise ValueError(
             f"{len(sequence)} residues but {len(states)} 3Di states to combine"
         )
-    return "".join(f"{aa}{s}" for aa, s in zip(sequence.upper(), states))
+    return "".join(
+        f"{_residue(aa)}{s if aa in STANDARD_RESIDUES else MASK_3DI}"
+        for aa, s in zip(sequence.upper(), states)
+    )
 
 
 def _get_encoder():
